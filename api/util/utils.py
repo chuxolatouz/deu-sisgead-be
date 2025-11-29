@@ -38,13 +38,27 @@ def string_to_int(string_float):
 def generar_token(usuario, secret):
     now = datetime.now()
     thirty_days_later = now + timedelta(days=30)
+    
+    # Determinar el rol: usar el nuevo campo 'rol' si existe, sino mantener compatibilidad con is_admin
+    if "rol" in usuario:
+        role = usuario["rol"]
+    elif usuario.get("is_admin"):
+        role = "super_admin"  # Migración: is_admin = True -> super_admin
+    else:
+        role = "usuario"
+    
     payload = {
         "sub": str(usuario["_id"]),
         "email": usuario["email"],
         "nombre": usuario["nombre"],
-        "role": "admin" if usuario.get("is_admin") else "usuario",
+        "role": role,
         "exp": int(thirty_days_later.timestamp()),
     }
+    
+    # Incluir departamento_id si existe
+    if "departamento_id" in usuario and usuario["departamento_id"]:
+        payload["departamento_id"] = str(usuario["departamento_id"])
+    
     token = jwt.encode(payload, secret, algorithm="HS256")
     return token
 
