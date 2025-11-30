@@ -100,7 +100,7 @@ app.json_encoder = JSONEncoder
 
 
 @app.route("/registrar", methods=["POST"])
-@validar_datos({"nombre": str, "email": str, "password": str})
+@validar_datos({"nombre": str, "email": str, "password": str, "rol": str})
 def registrar():
     """
     Endpoint para registrar una persona en la plataforma.
@@ -123,9 +123,11 @@ def registrar():
             password:
               type: string
               example: "password123"
-            is_admin:
-              type: boolean
-              example: false
+            rol:
+              type: string
+              enum: [usuario, admin_departamento, super_admin]
+              example: "usuario"
+              description: "Rol del usuario. Valores permitidos: usuario, admin_departamento, super_admin"
     responses:
       201:
         description: Usuario registrado con éxito.
@@ -136,35 +138,27 @@ def registrar():
               type: string
               example: "Usuario registrado con éxito"
       400:
-        description: Error en los datos enviados.
+        description: Error en los datos enviados o el email ya está registrado.
     """
 
     data = request.get_json()
+    
+    # Verificar que el usuario no exista (por email)
+    usuario_existente = db_usuarios.find_one({"email": data["email"]})
+    if usuario_existente:
+        return jsonify({"message": "El email ya está registrado"}), 400
+    
     hashed_pw = bcrypt.generate_password_hash(data["password"])
     data["password"] = hashed_pw
-    
-    # Manejar el nuevo sistema de roles
-    if "rol" not in data:
-        # Mantener compatibilidad: si tiene is_admin, convertir a rol
-        if data.get("is_admin"):
-            data["rol"] = "super_admin"
-        else:
-            data["rol"] = "usuario"
     
     # Validar que el rol sea uno de los permitidos
     roles_permitidos = ["usuario", "admin_departamento", "super_admin"]
     if data.get("rol") not in roles_permitidos:
         return jsonify({"message": f"Rol inválido. Debe ser uno de: {', '.join(roles_permitidos)}"}), 400
     
-    # Si se proporciona departamento_id, validar que existe
-    if "departamento_id" in data and data["departamento_id"]:
-        try:
-            departamento = db_departamentos.find_one({"_id": ObjectId(data["departamento_id"])})
-            if not departamento:
-                return jsonify({"message": "Departamento no encontrado"}), 400
-            data["departamento_id"] = ObjectId(data["departamento_id"])
-        except Exception:
-            return jsonify({"message": "ID de departamento inválido"}), 400
+    # Eliminar departamento_id si se envía (se asigna después del registro)
+    if "departamento_id" in data:
+        del data["departamento_id"]
     
     db_usuarios.insert_one(data)
     return jsonify({"message": "Usuario registrado con éxito"}), 201
