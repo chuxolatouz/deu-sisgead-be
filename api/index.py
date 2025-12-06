@@ -30,6 +30,7 @@ from io import BytesIO
 
 
 ##pb
+from flask import render_template
 from fastapi import BackgroundTasks
 from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
 from pydantic import BaseModel
@@ -50,6 +51,8 @@ env_file = ".env.test" if os.getenv("FLASK_ENV") == "testing" else ".env"
 load_dotenv(env_file)
 
 app = Flask(__name__)
+app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))
+
 Swagger(app)
 
 app.config["MONGO_URI"] = os.getenv("MONGODB_URI", "mongodb://localhost:27017/enii")
@@ -2942,29 +2945,55 @@ async def send_email_async(subject: str, email_to: str, body: str):
 
 #@app.post("/api/send-notification")
 @app.route("/send-notification", methods=["POST"])
-
-# BUENA PRÁCTICA (Síncrona):
-@app.route("/send-notification", methods=["POST"])
-def send_notification_endpoint(): # <--- Debe ser 'def'
+def send_notification_endpoint():
     """
-    Endpoint para enviar una notificación por correo electrónico.
+    Endpoint para enviar una notificación por correo electrónico con plantilla.
+    ---
+    tags:
+      - Email
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            recipient:
+              type: string
+              example: "usuario@example.com"
+            template:
+              type: string
+              example: "notificacion.html"
+            variables:
+              type: object
+              example: {
+                "nombre": "Juan",
+                "titulo": "Notificación importante",
+                "mensaje": "Este es un mensaje de prueba"
+              }
+            subject:
+              type: string
+              example: "Notificación del sistema"
+    responses:
+      200:
+        description: Email enviándose en segundo plano
+      400:
+        description: Faltan datos requeridos
     """
-    # ... Tu código de envío de correo (usando threading, como se sugirió anteriormente)
-    
     data = request.get_json()
     recipient = data.get("recipient")
     subject = data.get("subject")
-    body = data.get("body")
+    template_name = data.get("template")
+    variables = data.get("variables", {})
     
-    if not recipient or not subject or not body:
-        return jsonify({"message": "Faltan datos requeridos (recipient, subject, body)"}), 400
+    if not recipient or not subject or not template_name:
+        return jsonify({"message": "Faltan datos: recipient, subject, template"}), 400
 
-    # Asegúrate de que esta función 'send_email_notification' utiliza threading
-    # o cualquier método síncrono y no es una función asíncrona ('async def').
-    send_email_notification(subject, recipient, body) 
-
-    return jsonify({"message": "Notificación por correo electrónico enviándose en segundo plano"}), 200
-# Coloca estas funciones DESPUÉS de 'mail = Mail(app)'
+    try:
+        send_email_notification(subject, recipient, template_name, variables)
+        return jsonify({"message": "Email enviándose en segundo plano"}), 200
+    except Exception as e:
+        return jsonify({"message": f"Error: {str(e)}"}), 500# Coloca estas funciones DESPUÉS de 'mail = Mail(app)'
 # Coloca estas funciones DESPUÉS de 'mail = Mail(app)'
 
 # index.py (Colocadas después de mail = Mail(app))
@@ -2972,25 +3001,32 @@ def send_notification_endpoint(): # <--- Debe ser 'def'
 # NOTA: La variable global 'mail' se define ANTES de estas funciones
 # mail = Mail(app) 
 
-def send_async_email(app, mail_obj, subject, recipient, body):
-    """Esta función se ejecuta en un hilo separado (Thread-X)."""
-    
-    # 1. Abrimos el contexto de la aplicación, que es obligatorio para Flask-Mail
+def send_async_email(app, mail_obj, subject, recipient, body, is_html=True):
+    """Esta función se ejecuta en un hilo separado."""
     with app.app_context(): 
+        msg = Message(subject, recipients=[recipient])
         
-        # 2. Creamos el mensaje. El remitente por defecto ya está configurado.
-        msg = Message(subject, recipients=[recipient], html=body) 
-        
-        # 3. Usamos el objeto Mail que se pasó por el argumento
+        if is_html:
+            msg.html = body
+        else:
+            msg.body = body
+            
         mail_obj.send(msg) 
 
-def send_email_notification(subject, recipient, body):
-    """Llamada desde el endpoint de Flask."""
+def send_email_notification(subject, recipient, template_name, template_vars):
+    """
+    Llamada desde el endpoint de Flask.
+    - template_name: nombre del archivo (ej: 'notificacion.html')
+    - template_vars: dict con variables para la plantilla (ej: {'nombre': 'Juan', 'mensaje': '...'})
+    """
     
-    # 4. Iniciamos el hilo, pasando la 'app' y el objeto 'mail' inicializado
+    # Renderizar la plantilla
+    html_body = render_template(f'emails/{template_name}', **template_vars)
+    
     thr = threading.Thread(
         target=send_async_email, 
-        args=[app, mail, subject, recipient, body] # ⬅️ Pasamos 'mail' (la variable global)
+        args=[app, mail, subject, recipient, html_body, True]
     )
     thr.start()
     return thr
+
