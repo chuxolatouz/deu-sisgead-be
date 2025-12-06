@@ -28,6 +28,20 @@ import math
 import string
 from io import BytesIO
 
+
+##pb
+from fastapi import BackgroundTasks
+from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+from pydantic import BaseModel
+import os
+from dotenv import load_dotenv
+
+from flask_mail import Mail, Message
+import threading # (Si estás usando el método de threading)
+# Cerca del inicio de index.py
+load_dotenv()
+##end pb
+
 ### Swagger UI configuration ###f
 SWAGGER_URL = '/swagger'   # URL for exposing Swagger UI (without trailing slash)
 API_URL = '/swagger.json'  # Our API url route
@@ -42,6 +56,24 @@ app.config["MONGO_URI"] = os.getenv("MONGODB_URI", "mongodb://localhost:27017/en
 # app.config["MONGO_URI"] = "mongodb://localhost:27017/mi_db"
 app.config["TESTING"] = os.getenv("FLASK_ENV") == "testing"
 app.config["SECRET_KEY"] = "tu_clave_secreta"
+
+app.config['MAIL_SERVER'] = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+app.config['MAIL_PORT'] = int(os.getenv("SMTP_PORT", 465)) # Usará 465
+app.config['MAIL_USERNAME'] = os.getenv("SMTP_USER")
+app.config['MAIL_PASSWORD'] = os.getenv("SMTP_PASSWORD")
+
+# 🚨 CAMBIOS CLAVE PARA EL PUERTO 465 (SSL)
+app.config['MAIL_USE_TLS'] = False  # <--- Ahora Falso
+app.config['MAIL_USE_SSL'] = True   # <--- Ahora Verdadero
+
+app.config['MAIL_DEFAULT_SENDER'] = os.getenv("EMAIL_SENDER")
+
+
+MAIL_TLS=True,  # O False si no usas TLS
+MAIL_SSL=False, # O True si usas SSL (puerto 465)
+USE_CREDENTIALS=True,
+
+
 mongo = PyMongo(app)
 bcrypt = Bcrypt(app)
 CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:3000"}})
@@ -2884,3 +2916,81 @@ def error_500(e):
 
 if __name__ == "__main__":
     app.run()
+
+
+#pb# -----------------------
+#load_dotenv() # Carga las variables de entorno
+
+#app = FastAPI()
+# 🚨 La variable 'mail' DEBE definirse aquí, antes de las funciones
+mail = Mail(app)
+
+class EmailSchema(BaseModel):
+    recipient: str
+    subject: str
+    body: str
+
+async def send_email_async(subject: str, email_to: str, body: str):
+    message = MessageSchema(
+        subject=subject,
+        recipients=[email_to],
+        body=body,
+        subtype="plain"  # o "html" para contenido HTML
+    )
+    fm = FastMail(app)
+    await fm.send_message(message)
+
+#@app.post("/api/send-notification")
+@app.route("/send-notification", methods=["POST"])
+
+# BUENA PRÁCTICA (Síncrona):
+@app.route("/send-notification", methods=["POST"])
+def send_notification_endpoint(): # <--- Debe ser 'def'
+    """
+    Endpoint para enviar una notificación por correo electrónico.
+    """
+    # ... Tu código de envío de correo (usando threading, como se sugirió anteriormente)
+    
+    data = request.get_json()
+    recipient = data.get("recipient")
+    subject = data.get("subject")
+    body = data.get("body")
+    
+    if not recipient or not subject or not body:
+        return jsonify({"message": "Faltan datos requeridos (recipient, subject, body)"}), 400
+
+    # Asegúrate de que esta función 'send_email_notification' utiliza threading
+    # o cualquier método síncrono y no es una función asíncrona ('async def').
+    send_email_notification(subject, recipient, body) 
+
+    return jsonify({"message": "Notificación por correo electrónico enviándose en segundo plano"}), 200
+# Coloca estas funciones DESPUÉS de 'mail = Mail(app)'
+# Coloca estas funciones DESPUÉS de 'mail = Mail(app)'
+
+# index.py (Colocadas después de mail = Mail(app))
+
+# NOTA: La variable global 'mail' se define ANTES de estas funciones
+# mail = Mail(app) 
+
+def send_async_email(app, mail_obj, subject, recipient, body):
+    """Esta función se ejecuta en un hilo separado (Thread-X)."""
+    
+    # 1. Abrimos el contexto de la aplicación, que es obligatorio para Flask-Mail
+    with app.app_context(): 
+        
+        # 2. Creamos el mensaje. El remitente por defecto ya está configurado.
+        msg = Message(subject, recipients=[recipient], html=body) 
+        
+        # 3. Usamos el objeto Mail que se pasó por el argumento
+        mail_obj.send(msg) 
+
+def send_email_notification(subject, recipient, body):
+    """Llamada desde el endpoint de Flask."""
+    
+    # 4. Iniciamos el hilo, pasando la 'app' y el objeto 'mail' inicializado
+    thr = threading.Thread(
+        target=send_async_email, 
+        args=[app, mail, subject, recipient, body] # ⬅️ Pasamos 'mail' (la variable global)
+    )
+    thr.start()
+    return thr
