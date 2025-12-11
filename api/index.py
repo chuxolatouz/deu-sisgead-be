@@ -608,6 +608,70 @@ def listar_departamentos():
     list_json = json.loads(list_dump.replace("\\", ""))
     return jsonify(list_json), 200
 
+@app.route("/departamentos/<string:departamento_id>", methods=["GET"])
+@allow_cors
+def obtener_departamento(departamento_id):
+    """
+    Endpoint para obtener un departamento por ID.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: path
+        name: departamento_id
+        required: true
+        description: ID del departamento a obtener.
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
+    responses:
+      200:
+        description: Departamento obtenido con éxito.
+        schema:
+          type: object
+          properties:
+            _id:
+              type: string
+              example: "64b8f3e2c9d1a2b3c4d5e6f7"
+            nombre:
+              type: string
+              example: "Gestión de Proyectos"
+            descripcion:
+              type: string
+              example: "Departamento encargado de la gestión de proyectos"
+            codigo:
+              type: string
+              example: "GP"
+            fecha_creacion:
+              type: string
+              example: "2025-01-15T10:30:00Z"
+            activo:
+              type: boolean
+              example: true
+      404:
+        description: Departamento no encontrado.
+      400:
+        description: ID de departamento inválido.
+    """
+    try:
+        departamento_id_obj = ObjectId(departamento_id.strip())
+    except Exception:
+        return jsonify({"message": "ID de departamento inválido"}), 400
+    
+    departamento = db_departamentos.find_one({"_id": departamento_id_obj})
+    
+    if not departamento:
+        return jsonify({"message": "Departamento no encontrado"}), 404
+    
+    # Convertir ObjectId a string para la respuesta JSON
+    departamento["_id"] = str(departamento["_id"])
+    
+    # Serializar la respuesta
+    departamento_dump = json.dumps(departamento, default=json_util.default, ensure_ascii=False)
+    departamento_json = json.loads(departamento_dump.replace("\\", ""))
+    
+    return jsonify(departamento_json), 200
+
 @app.route("/departamentos/<string:departamento_id>", methods=["PUT"])
 @allow_cors
 @token_required
