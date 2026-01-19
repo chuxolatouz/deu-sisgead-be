@@ -1,6 +1,7 @@
 from flask import make_response, request, jsonify, current_app
 from jose import jwt
 from functools import wraps
+from api.util.utils import obtener_contexto_departamento_desde_header
 
 
 def allow_cors(f):
@@ -45,6 +46,14 @@ def token_required(f):
             print("Error decoding token: %s", str(e))
 
             return jsonify({"message": "Token no es válido o ha expirado"}), 403
+
+        # Agregar contexto de departamento si es super_admin y tiene el header
+        contexto_dept = obtener_contexto_departamento_desde_header(data)
+        if contexto_dept:
+            data["departamento_id"] = contexto_dept
+            # Marcar que está usando contexto temporal
+            data["_using_dept_context"] = True
+            print(f"[DEBUG] Contexto de departamento aplicado: {contexto_dept} para usuario {data.get('email', 'N/A')}")
 
         return f(data, *args, **kwargs)
 

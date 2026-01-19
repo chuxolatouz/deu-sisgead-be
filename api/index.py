@@ -856,6 +856,85 @@ def cambiar_rol_usuario(user):
 
     return jsonify({"message": "Rol actualizado correctamente"}), 200
 
+@app.route("/contexto_departamento", methods=["GET"])
+@allow_cors
+@token_required
+def obtener_contexto_departamento(user):
+    """
+    Endpoint para obtener el contexto actual del departamento.
+    Solo disponible para super_admin. Retorna el departamento_id del contexto
+    si está activo, o null si no hay contexto activo.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: header
+        name: X-Department-Context
+        required: false
+        description: ID del departamento para el contexto (solo para super_admin)
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
+    responses:
+      200:
+        description: Contexto del departamento obtenido con éxito.
+        schema:
+          type: object
+          properties:
+            departamento_id:
+              type: string
+              nullable: true
+              example: "64b8f3e2c9d1a2b3c4d5e6f7"
+            usando_contexto:
+              type: boolean
+              example: true
+            departamento:
+              type: object
+              nullable: true
+              properties:
+                _id:
+                  type: string
+                nombre:
+                  type: string
+                descripcion:
+                  type: string
+                codigo:
+                  type: string
+      403:
+        description: Solo super_admin puede usar este endpoint.
+    """
+    # Solo super_admin puede usar este endpoint
+    if user.get("role") != "super_admin":
+        return jsonify({"message": "Solo super_admin puede usar este endpoint"}), 403
+    
+    # Obtener el contexto del header
+    dept_context = request.headers.get("X-Department-Context")
+    usando_contexto = False
+    departamento = None
+    
+    if dept_context:
+        try:
+            dept_id_obj = ObjectId(dept_context.strip())
+            # Validar que el departamento existe
+            dept = db_departamentos.find_one({"_id": dept_id_obj})
+            if dept:
+                usando_contexto = True
+                departamento = {
+                    "_id": str(dept["_id"]),
+                    "nombre": dept.get("nombre", ""),
+                    "descripcion": dept.get("descripcion", ""),
+                    "codigo": dept.get("codigo", ""),
+                }
+        except Exception:
+            # Si hay error, no hay contexto válido
+            pass
+    
+    return jsonify({
+        "departamento_id": dept_context.strip() if dept_context and usando_contexto else None,
+        "usando_contexto": usando_contexto,
+        "departamento": departamento
+    }), 200
+
 @app.route("/asignar_rol", methods=["PATCH"])
 @token_required
 def asignar_rol():
@@ -898,42 +977,89 @@ def asignar_rol():
 
 
 @app.route("/crear_proyecto", methods=["POST"])
+@allow_cors
 @token_required
 @validar_datos(
     {"nombre": str, "descripcion": str, "fecha_inicio": str, "fecha_fin": str}
 )
 def crear_proyecto(user):
     """
-    Endpoint para asignar un rol a un usuario.
+    Endpoint para crear un nuevo proyecto.
     ---
     tags:
-      - Roles
+      - Proyectos
     parameters:
       - in: body
         name: body
         required: true
-        description: Datos para asignar el rol.
+        description: Datos del proyecto a crear.
         schema:
           type: object
           properties:
-            user_id:
+            nombre:
               type: string
+              example: "Proyecto de Desarrollo"
+            descripcion:
+              type: string
+              example: "Descripción del proyecto"
+            fecha_inicio:
+              type: string
+              example: "2025-01-01"
+            fecha_fin:
+              type: string
+              example: "2025-12-31"
+            departamento_id:
+              type: string
+              required: false
               example: "64b8f3e2c9d1a2b3c4d5e6f7"
-            rol_id:
-              type: string
-              example: "64b8f3e2c9d1a2b3c4d5e6f8"
+              description: ID del departamento al que pertenece el proyecto (opcional)
     responses:
-      200:
-        description: Rol asignado con éxito.
+      201:
+        description: Proyecto creado con éxito.
         schema:
           type: object
           properties:
             message:
               type: string
-              example: "Rol asignado con éxito"
+              example: "Proyecto creado con éxito"
+            _id:
+              type: string
+              example: "64b8f3e2c9d1a2b3c4d5e6f7"
+      400:
+        description: Error en los datos enviados o departamento no encontrado.
     """
     current_user = user["sub"]
     data = request.get_json()
+    
+    # Manejar departamento_id
+    departamento_id = None
+    
+    # Si se proporciona departamento_id en el body, validarlo
+    if "departamento_id" in data and data["departamento_id"]:
+        try:
+            dept_id_obj = ObjectId(data["departamento_id"])
+            # Validar que el departamento existe
+            departamento = db_departamentos.find_one({"_id": dept_id_obj})
+            if not departamento:
+                return jsonify({"message": "Departamento no encontrado"}), 400
+            departamento_id = dept_id_obj
+        except Exception:
+            return jsonify({"message": "ID de departamento inválido"}), 400
+    # Si no se proporciona, usar el departamento del usuario si tiene contexto o es admin_departamento
+    elif user.get("_using_dept_context") and "departamento_id" in user:
+        # Usuario super_admin con contexto de departamento
+        try:
+            departamento_id = ObjectId(user["departamento_id"])
+        except Exception:
+            pass
+    elif user.get("role") == "admin_departamento" and "departamento_id" in user:
+        # Usuario admin_departamento, usar su departamento
+        try:
+            departamento_id = ObjectId(user["departamento_id"])
+        except Exception:
+            pass
+    
+    # Preparar datos del proyecto
     data["miembros"] = []
     data["balance"] = 000
     data["balance_inicial"] = 000
@@ -945,6 +1071,11 @@ def crear_proyecto(user):
     data["show"] = {"status": False}
     data["owner"] = ObjectId(current_user)
     data["user"] = user
+    
+    # Asignar departamento_id si se determinó uno
+    if departamento_id:
+        data["departamento_id"] = departamento_id
+    
     project = db_proyectos.insert_one(data)
     message_log = "Usuario %s ha creado el proyecto" % user["nombre"]
     agregar_log(project.inserted_id, message_log)
@@ -1612,9 +1743,31 @@ def mostrar_proyectos(user):
         ]
     }
     dir(user)
-    # Super admin puede ver todos los proyectos
+    # Super admin puede ver todos los proyectos, a menos que tenga contexto de departamento
     if user.get("role") == "super_admin":
-        query = {}
+        # Si super_admin tiene contexto de departamento, filtrar como admin_departamento
+        if user.get("_using_dept_context") and "departamento_id" in user:
+            try:
+                dept_id = ObjectId(user["departamento_id"])
+                query = {
+                    "$or": [
+                        {"departamento_id": dept_id},  # Proyectos del departamento del contexto
+                        {"owner": user["sub"]},  # Proyectos que es dueño
+                        {
+                            "miembros": {
+                                "$elemMatch": {
+                                    "usuario._id.$oid": user["sub"]
+                                }
+                            }
+                        },  # Proyectos donde es miembro
+                    ]
+                }
+            except Exception:
+                # Si hay error con el ObjectId, mantener la query original (ver todos)
+                query = {}
+        else:
+            # Sin contexto, ver todos los proyectos
+            query = {}
     # Admin de departamento puede ver proyectos de su departamento, además de los que es dueño o miembro
     elif user.get("role") == "admin_departamento" and "departamento_id" in user:
         try:
@@ -3032,7 +3185,8 @@ def obtener_reporte_proyecto(id):
 
 @app.route('/dashboard_global', methods=['GET'])
 @allow_cors
-def resumen_general():
+@token_required
+def resumen_general(user):
     """
     Endpoint para obtener un resumen general del sistema.
     ---
@@ -3045,6 +3199,13 @@ def resumen_general():
         enum: [1m, 6m, 1y, all]
         default: 6m
         description: Rango de tiempo a mostrar.
+      - in: header
+        name: X-Department-Context
+        required: false
+        description: ID del departamento para el contexto (solo para super_admin)
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
     responses:
       200:
         description: Resumen general del sistema
@@ -3113,29 +3274,69 @@ def resumen_general():
     else:
       date_limit = None  # mostrar todo
 
+    # Determinar filtro de proyectos según el contexto del usuario
+    filtro_proyectos = {}
+    filtro_proyectos_ids = None  # Para filtrar acciones y documentos
+    
+    # Super admin puede ver todos los proyectos, a menos que tenga contexto de departamento
+    if user.get("role") == "super_admin":
+        # Si super_admin tiene contexto de departamento, filtrar como admin_departamento
+        if user.get("_using_dept_context") and "departamento_id" in user:
+            try:
+                dept_id = ObjectId(user["departamento_id"])
+                filtro_proyectos = {"departamento_id": dept_id}
+                # Obtener IDs de proyectos del departamento para filtrar acciones y documentos
+                proyectos_dept = list(db_proyectos.find(filtro_proyectos, {"_id": 1}))
+                filtro_proyectos_ids = [p["_id"] for p in proyectos_dept]
+            except Exception:
+                # Si hay error con el ObjectId, mantener sin filtro (ver todos)
+                pass
+    # Admin de departamento puede ver proyectos de su departamento
+    elif user.get("role") == "admin_departamento" and "departamento_id" in user:
+        try:
+            dept_id = ObjectId(user["departamento_id"])
+            filtro_proyectos = {"departamento_id": dept_id}
+            # Obtener IDs de proyectos del departamento para filtrar acciones y documentos
+            proyectos_dept = list(db_proyectos.find(filtro_proyectos, {"_id": 1}))
+            filtro_proyectos_ids = [p["_id"] for p in proyectos_dept]
+        except Exception:
+            # Si hay error con el ObjectId, mantener sin filtro
+            pass
+
     # Totales de ingresos y egresos
     filtro_fecha = {}
     if date_limit:
         filtro_fecha = { "created_at": { "$gte": date_limit } }
+    
+    # Filtrar acciones por proyectos del departamento si aplica
+    filtro_acciones = {**filtro_fecha}
+    if filtro_proyectos_ids:
+        filtro_acciones["project_id"] = {"$in": filtro_proyectos_ids}
+    
     ingresos = 0
     egresos = 0
-    for a in db_acciones.find(filtro_fecha):
+    for a in db_acciones.find(filtro_acciones):
         monto = a.get("amount", 0)
         if monto >= 0:
             ingresos += monto
         else:
             egresos += abs(monto)
 
-    # Categorías de proyectos
-    categorias = list(db_proyectos.aggregate([
+    # Categorías de proyectos (filtrar por departamento si aplica)
+    pipeline_categorias = []
+    if filtro_proyectos:
+        pipeline_categorias.append({"$match": filtro_proyectos})
+    pipeline_categorias.extend([
         {"$group": {"_id": "$categoria", "count": {"$sum": 1}}},
         {"$project": {"categoria": "$_id", "count": 1, "_id": 0}}
-    ]))
+    ])
+    categorias = list(db_proyectos.aggregate(pipeline_categorias))
+    
     # Encontrar ocurrencias de usuarios en proyectos
     conteo_usuarios = defaultdict(lambda: {"name": "", "projects": 0})
 
-    # Consulta todos los proyectos
-    proyectos = list(db_proyectos.find())
+    # Consulta proyectos (ya filtrados por departamento si aplica)
+    proyectos = list(db_proyectos.find(filtro_proyectos))
 
     for proyecto in proyectos:
         miembros = proyecto.get("miembros", [])
@@ -3151,17 +3352,31 @@ def resumen_general():
     # Transformar a arreglo final
     ocurrencias = [{"id": user_id, "name": info["name"], "projects": info["projects"]}
                   for user_id, info in conteo_usuarios.items()]
-    # Resumen global
+    
+    # Resumen global (filtrar por departamento si aplica)
+    filtro_documentos = {**filtro_fecha}
+    if filtro_proyectos_ids:
+        filtro_documentos["proyecto_id"] = {"$in": filtro_proyectos_ids}
+    
+    filtro_documentos_finalizados = {"status": "finished", **filtro_fecha}
+    if filtro_proyectos_ids:
+        filtro_documentos_finalizados["proyecto_id"] = {"$in": filtro_proyectos_ids}
+    
+    # Filtrar miembros: solo usuarios del departamento si hay contexto
+    filtro_usuarios = {}
+    if filtro_proyectos and "departamento_id" in filtro_proyectos:
+        filtro_usuarios = {"departamento_id": filtro_proyectos["departamento_id"]}
+    
     resumen = {
-        "proyectos": db_proyectos.count_documents({}),
-        "miembros": db_usuarios.count_documents({}),
-        "presupuestos": db_documentos.count_documents({**filtro_fecha}),
-        "presupuestos_finalizados": db_documentos.count_documents({"status": "finished", **filtro_fecha}),
+        "proyectos": db_proyectos.count_documents(filtro_proyectos),
+        "miembros": db_usuarios.count_documents(filtro_usuarios),
+        "presupuestos": db_documentos.count_documents(filtro_documentos),
+        "presupuestos_finalizados": db_documentos.count_documents(filtro_documentos_finalizados),
         "ocurrencias": ocurrencias,
-        "balance_total": sum(p.get("balance", 0) for p in db_proyectos.find(filtro_fecha))
+        "balance_total": sum(p.get("balance", 0) for p in proyectos)
     }
 
-    # Historial de saldo mensual
+    # Historial de saldo mensual (filtrar por proyectos del departamento si aplica)
     balance_acumulado = 0
     balanceHistory = []
 
@@ -3173,9 +3388,13 @@ def resumen_general():
         inicio_mes = datetime.strptime(mes, "%Y-%m")
         fin_mes = (inicio_mes + relativedelta(months=1))
 
-        movimientos = db_acciones.find({
+        filtro_movimientos = {
             "created_at": {"$gte": inicio_mes, "$lt": fin_mes}
-        })
+        }
+        if filtro_proyectos_ids:
+            filtro_movimientos["project_id"] = {"$in": filtro_proyectos_ids}
+
+        movimientos = db_acciones.find(filtro_movimientos)
 
         for m in movimientos:
             balance_acumulado += m.get("amount", 0)

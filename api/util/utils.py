@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from jose import jwt
 from bson import ObjectId, json_util
 from io import StringIO, BytesIO
-from flask import send_file
+from flask import send_file, request
 from api.util.generar_acta_inicio import generar_acta_inicio_pdf
 from api.util.backblaze import upload_file
 import csv  # Para CSV
@@ -167,3 +167,36 @@ def generar_json(movimientos):
         as_attachment=True,
         download_name="movimientos_proyecto.json"
     )
+
+
+def obtener_contexto_departamento_desde_header(user):
+    """
+    Obtiene el contexto del departamento desde el header X-Department-Context.
+    Solo funciona para super_admin. Si el header está presente y el usuario es super_admin,
+    retorna el departamento_id del header. En caso contrario, retorna el departamento_id
+    del token del usuario (si existe).
+    
+    Args:
+        user: Objeto del usuario decodificado del token JWT
+        
+    Returns:
+        str o None: El departamento_id del contexto o None si no hay contexto
+    """
+    # Solo super_admin puede usar el contexto de departamento
+    if user.get("role") == "super_admin":
+        # Intentar obtener el contexto del header
+        dept_context = request.headers.get("X-Department-Context")
+        print(f"[DEBUG] Header X-Department-Context recibido: {dept_context}")
+        if dept_context:
+            try:
+                # Validar que sea un ObjectId válido
+                ObjectId(dept_context.strip())
+                print(f"[DEBUG] Contexto de departamento válido: {dept_context.strip()}")
+                return dept_context.strip()
+            except Exception as e:
+                # Si no es un ObjectId válido, retornar None
+                print(f"[DEBUG] Error validando contexto de departamento: {str(e)}")
+                return None
+    
+    # Para otros usuarios, retornar el departamento_id del token si existe
+    return user.get("departamento_id")
