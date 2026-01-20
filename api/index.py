@@ -28,6 +28,21 @@ import math
 import string
 from io import BytesIO
 
+
+##pb
+from flask import render_template
+from fastapi import BackgroundTasks
+from fastapi_mail import FastMail, MessageSchema, ConnectionConfig
+from pydantic import BaseModel
+import os
+from dotenv import load_dotenv
+
+from flask_mail import Mail, Message
+import threading # (Si estás usando el método de threading)
+# Cerca del inicio de index.py
+load_dotenv()
+##end pb
+
 ### Swagger UI configuration ###f
 SWAGGER_URL = '/swagger'   # URL for exposing Swagger UI (without trailing slash)
 API_URL = '/swagger.json'  # Our API url route
@@ -36,12 +51,32 @@ env_file = ".env.test" if os.getenv("FLASK_ENV") == "testing" else ".env"
 load_dotenv(env_file)
 
 app = Flask(__name__)
+app = Flask(__name__, template_folder=os.path.join(os.path.dirname(__file__), 'templates'))
+
 Swagger(app)
 
 app.config["MONGO_URI"] = os.getenv("MONGODB_URI", "mongodb://localhost:27017/enii")
 # app.config["MONGO_URI"] = "mongodb://localhost:27017/mi_db"
 app.config["TESTING"] = os.getenv("FLASK_ENV") == "testing"
 app.config["SECRET_KEY"] = "tu_clave_secreta"
+
+app.config['MAIL_SERVER'] = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+app.config['MAIL_PORT'] = int(os.getenv("SMTP_PORT", 465)) # Usará 465
+app.config['MAIL_USERNAME'] = os.getenv("SMTP_USER")
+app.config['MAIL_PASSWORD'] = os.getenv("SMTP_PASSWORD")
+
+# 🚨 CAMBIOS CLAVE PARA EL PUERTO 465 (SSL)
+app.config['MAIL_USE_TLS'] = False  # <--- Ahora Falso
+app.config['MAIL_USE_SSL'] = True   # <--- Ahora Verdadero
+
+app.config['MAIL_DEFAULT_SENDER'] = os.getenv("EMAIL_SENDER")
+
+
+MAIL_TLS=True,  # O False si no usas TLS
+MAIL_SSL=False, # O True si usas SSL (puerto 465)
+USE_CREDENTIALS=True,
+
+
 mongo = PyMongo(app)
 bcrypt = Bcrypt(app)
 CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:3000"}})
@@ -3457,3 +3492,114 @@ def error_500(e):
 
 if __name__ == "__main__":
     app.run()
+
+
+#pb# -----------------------
+#load_dotenv() # Carga las variables de entorno
+
+#app = FastAPI()
+# 🚨 La variable 'mail' DEBE definirse aquí, antes de las funciones
+mail = Mail(app)
+
+class EmailSchema(BaseModel):
+    recipient: str
+    subject: str
+    body: str
+
+async def send_email_async(subject: str, email_to: str, body: str):
+    message = MessageSchema(
+        subject=subject,
+        recipients=[email_to],
+        body=body,
+        subtype="plain"  # o "html" para contenido HTML
+    )
+    fm = FastMail(app)
+    await fm.send_message(message)
+
+#@app.post("/api/send-notification")
+@app.route("/send-notification", methods=["POST"])
+def send_notification_endpoint():
+    """
+    Endpoint para enviar una notificación por correo electrónico con plantilla.
+    ---
+    tags:
+      - Email
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          properties:
+            recipient:
+              type: string
+              example: "usuario@example.com"
+            template:
+              type: string
+              example: "notificacion.html"
+            variables:
+              type: object
+              example: {
+                "nombre": "Juan",
+                "titulo": "Notificación importante",
+                "mensaje": "Este es un mensaje de prueba"
+              }
+            subject:
+              type: string
+              example: "Notificación del sistema"
+    responses:
+      200:
+        description: Email enviándose en segundo plano
+      400:
+        description: Faltan datos requeridos
+    """
+    data = request.get_json()
+    recipient = data.get("recipient")
+    subject = data.get("subject")
+    template_name = data.get("template")
+    variables = data.get("variables", {})
+    
+    if not recipient or not subject or not template_name:
+        return jsonify({"message": "Faltan datos: recipient, subject, template"}), 400
+
+    try:
+        send_email_notification(subject, recipient, template_name, variables)
+        return jsonify({"message": "Email enviándose en segundo plano"}), 200
+    except Exception as e:
+        return jsonify({"message": f"Error: {str(e)}"}), 500# Coloca estas funciones DESPUÉS de 'mail = Mail(app)'
+# Coloca estas funciones DESPUÉS de 'mail = Mail(app)'
+
+# index.py (Colocadas después de mail = Mail(app))
+
+# NOTA: La variable global 'mail' se define ANTES de estas funciones
+# mail = Mail(app) 
+
+def send_async_email(app, mail_obj, subject, recipient, body, is_html=True):
+    """Esta función se ejecuta en un hilo separado."""
+    with app.app_context(): 
+        msg = Message(subject, recipients=[recipient])
+        
+        if is_html:
+            msg.html = body
+        else:
+            msg.body = body
+            
+        mail_obj.send(msg) 
+
+def send_email_notification(subject, recipient, template_name, template_vars):
+    """
+    Llamada desde el endpoint de Flask.
+    - template_name: nombre del archivo (ej: 'notificacion.html')
+    - template_vars: dict con variables para la plantilla (ej: {'nombre': 'Juan', 'mensaje': '...'})
+    """
+    
+    # Renderizar la plantilla
+    html_body = render_template(f'emails/{template_name}', **template_vars)
+    
+    thr = threading.Thread(
+        target=send_async_email, 
+        args=[app, mail, subject, recipient, html_body, True]
+    )
+    thr.start()
+    return thr
+
