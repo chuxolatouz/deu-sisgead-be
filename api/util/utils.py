@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from jose import jwt
 from bson import ObjectId, json_util
 from io import StringIO, BytesIO
-from flask import send_file
+from flask import send_file, request
 from api.util.generar_acta_inicio import generar_acta_inicio_pdf
 from api.util.backblaze import upload_file
 import csv  # Para CSV
@@ -38,13 +38,27 @@ def string_to_int(string_float):
 def generar_token(usuario, secret):
     now = datetime.now()
     thirty_days_later = now + timedelta(days=30)
+    
+    # Determinar el rol: usar el nuevo campo 'rol' si existe, sino mantener compatibilidad con is_admin
+    if "rol" in usuario:
+        role = usuario["rol"]
+    elif usuario.get("is_admin"):
+        role = "super_admin"  # Migración: is_admin = True -> super_admin
+    else:
+        role = "usuario"
+    
     payload = {
         "sub": str(usuario["_id"]),
         "email": usuario["email"],
         "nombre": usuario["nombre"],
-        "role": "admin" if usuario.get("is_admin") else "usuario",
+        "role": role,
         "exp": int(thirty_days_later.timestamp()),
     }
+    
+    # Incluir departamento_id si existe
+    if "departamento_id" in usuario and usuario["departamento_id"]:
+        payload["departamento_id"] = str(usuario["departamento_id"])
+    
     token = jwt.encode(payload, secret, algorithm="HS256")
     return token
 
@@ -153,3 +167,36 @@ def generar_json(movimientos):
         as_attachment=True,
         download_name="movimientos_proyecto.json"
     )
+
+
+def obtener_contexto_departamento_desde_header(user):
+    """
+    Obtiene el contexto del departamento desde el header X-Department-Context.
+    Solo funciona para super_admin. Si el header está presente y el usuario es super_admin,
+    retorna el departamento_id del header. En caso contrario, retorna el departamento_id
+    del token del usuario (si existe).
+    
+    Args:
+        user: Objeto del usuario decodificado del token JWT
+        
+    Returns:
+        str o None: El departamento_id del contexto o None si no hay contexto
+    """
+    # Solo super_admin puede usar el contexto de departamento
+    if user.get("role") == "super_admin":
+        # Intentar obtener el contexto del header
+        dept_context = request.headers.get("X-Department-Context")
+        print(f"[DEBUG] Header X-Department-Context recibido: {dept_context}")
+        if dept_context:
+            try:
+                # Validar que sea un ObjectId válido
+                ObjectId(dept_context.strip())
+                print(f"[DEBUG] Contexto de departamento válido: {dept_context.strip()}")
+                return dept_context.strip()
+            except Exception as e:
+                # Si no es un ObjectId válido, retornar None
+                print(f"[DEBUG] Error validando contexto de departamento: {str(e)}")
+                return None
+    
+    # Para otros usuarios, retornar el departamento_id del token si existe
+    return user.get("departamento_id")

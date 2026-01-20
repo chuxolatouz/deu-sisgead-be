@@ -62,6 +62,7 @@ db_categorias = mongo.db.categorias
 db_documentos = mongo.db.documentos
 db_solicitudes = mongo.db.solicitudes
 db_logs = mongo.db.logs
+db_departamentos = mongo.db.departamentos
 
 # Definir una función personalizada de serialización para manejar los objetos ObjectId
 
@@ -99,7 +100,7 @@ app.json_encoder = JSONEncoder
 
 
 @app.route("/registrar", methods=["POST"])
-@validar_datos({"nombre": str, "email": str, "password": str})
+@validar_datos({"nombre": str, "email": str, "password": str, "rol": str})
 def registrar():
     """
     Endpoint para registrar una persona en la plataforma.
@@ -122,9 +123,11 @@ def registrar():
             password:
               type: string
               example: "password123"
-            is_admin:
-              type: boolean
-              example: false
+            rol:
+              type: string
+              enum: [usuario, admin_departamento, super_admin]
+              example: "usuario"
+              description: "Rol del usuario. Valores permitidos: usuario, admin_departamento, super_admin"
     responses:
       201:
         description: Usuario registrado con éxito.
@@ -135,14 +138,30 @@ def registrar():
               type: string
               example: "Usuario registrado con éxito"
       400:
-        description: Error en los datos enviados.
+        description: Error en los datos enviados o el email ya está registrado.
     """
 
     data = request.get_json()
+    
+    # Verificar que el usuario no exista (por email)
+    usuario_existente = db_usuarios.find_one({"email": data["email"]})
+    if usuario_existente:
+        return jsonify({"message": "El email ya está registrado"}), 400
+    
     hashed_pw = bcrypt.generate_password_hash(data["password"])
     data["password"] = hashed_pw
+    
+    # Validar que el rol sea uno de los permitidos
+    roles_permitidos = ["usuario", "admin_departamento", "super_admin"]
+    if data.get("rol") not in roles_permitidos:
+        return jsonify({"message": f"Rol inválido. Debe ser uno de: {', '.join(roles_permitidos)}"}), 400
+    
+    # Eliminar departamento_id si se envía (se asigna después del registro)
+    if "departamento_id" in data:
+        del data["departamento_id"]
+    
     db_usuarios.insert_one(data)
-    return jsonify({"message": "Usuario registrado con rxito"}), 201
+    return jsonify({"message": "Usuario registrado con éxito"}), 201
 
 
 @app.route("/login", methods=["POST"])
@@ -195,15 +214,27 @@ def login():
     if usuario and bcrypt.check_password_hash(usuario["password"], data["password"]):
         token = generar_token(usuario, app.config["SECRET_KEY"])
 
-        return jsonify(
-            {
-                "token": token,
-                "email": data["email"],
-                "id": str(usuario["_id"]),
-                "nombre": usuario["nombre"],
-                "role": "admin" if usuario.get("is_admin") else "usuario",
-            }
-        ), 200
+        # Determinar el rol: usar el nuevo campo 'rol' si existe, sino mantener compatibilidad con is_admin
+        if "rol" in usuario:
+            role = usuario["rol"]
+        elif usuario.get("is_admin"):
+            role = "super_admin"  # Migración: is_admin = True -> super_admin
+        else:
+            role = "usuario"
+
+        response_data = {
+            "token": token,
+            "email": data["email"],
+            "id": str(usuario["_id"]),
+            "nombre": usuario["nombre"],
+            "role": role,
+        }
+        
+        # Incluir departamento_id si existe
+        if "departamento_id" in usuario:
+            response_data["departamento_id"] = str(usuario["departamento_id"])
+
+        return jsonify(response_data), 200
     else:
         return jsonify({"message": "Credenciales inválidas"}), 401
 
@@ -470,9 +501,285 @@ def crear_categorias():
     
     return jsonify({"message": "Categoría creada con éxito", "_id": str(categoria_insertada.inserted_id)}), 201
 
+@app.route("/departamentos", methods=["POST"])
+@allow_cors
+@token_required
+@validar_datos({"nombre": str, "descripcion": str, "codigo": str})
+def crear_departamento(user):
+    """
+    Endpoint para crear un nuevo departamento.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: body
+        name: body
+        required: true
+        description: Datos del departamento a crear.
+        schema:
+          type: object
+          properties:
+            nombre:
+              type: string
+              example: "Gestión de Proyectos"
+            descripcion:
+              type: string
+              example: "Departamento encargado de la gestión de proyectos"
+            codigo:
+              type: string
+              example: "GP"
+    responses:
+      201:
+        description: Departamento creado con éxito.
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Departamento creado con éxito"
+            _id:
+              type: string
+              example: "64b8f3e2c9d1a2b3c4d5e6f7"
+      400:
+        description: Error en los datos enviados.
+    """
+    data = request.get_json()
+    departamento = {
+        "nombre": data["nombre"],
+        "descripcion": data["descripcion"],
+        "codigo": data["codigo"],
+        "fecha_creacion": datetime.now(timezone.utc),
+        "activo": True
+    }
+    departamento_insertado = db_departamentos.insert_one(departamento)
+    return jsonify({"message": "Departamento creado con éxito", "_id": str(departamento_insertado.inserted_id)}), 201
+
+@app.route("/departamentos", methods=["GET"])
+@allow_cors
+def listar_departamentos():
+    """
+    Endpoint para obtener la lista de departamentos.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: query
+        name: activo
+        required: false
+        description: Filtrar por departamentos activos (true/false).
+        schema:
+          type: boolean
+          example: true
+    responses:
+      200:
+        description: Lista de departamentos obtenida con éxito.
+        schema:
+          type: array
+          items:
+            type: object
+            properties:
+              _id:
+                type: string
+                example: "64b8f3e2c9d1a2b3c4d5e6f7"
+              nombre:
+                type: string
+                example: "Gestión de Proyectos"
+              descripcion:
+                type: string
+                example: "Departamento encargado de la gestión de proyectos"
+              codigo:
+                type: string
+                example: "GP"
+              fecha_creacion:
+                type: string
+                example: "2025-01-15T10:30:00Z"
+              activo:
+                type: boolean
+                example: true
+    """
+    params = request.args
+    query = {}
+    if params.get("activo") is not None:
+        query["activo"] = params.get("activo").lower() == "true"
+    
+    departamentos = db_departamentos.find(query)
+    list_cursor = list(departamentos)
+    list_dump = json.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
+    list_json = json.loads(list_dump.replace("\\", ""))
+    return jsonify(list_json), 200
+
+@app.route("/departamentos/<string:departamento_id>", methods=["GET"])
+@allow_cors
+def obtener_departamento(departamento_id):
+    """
+    Endpoint para obtener un departamento por ID.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: path
+        name: departamento_id
+        required: true
+        description: ID del departamento a obtener.
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
+    responses:
+      200:
+        description: Departamento obtenido con éxito.
+        schema:
+          type: object
+          properties:
+            _id:
+              type: string
+              example: "64b8f3e2c9d1a2b3c4d5e6f7"
+            nombre:
+              type: string
+              example: "Gestión de Proyectos"
+            descripcion:
+              type: string
+              example: "Departamento encargado de la gestión de proyectos"
+            codigo:
+              type: string
+              example: "GP"
+            fecha_creacion:
+              type: string
+              example: "2025-01-15T10:30:00Z"
+            activo:
+              type: boolean
+              example: true
+      404:
+        description: Departamento no encontrado.
+      400:
+        description: ID de departamento inválido.
+    """
+    try:
+        departamento_id_obj = ObjectId(departamento_id.strip())
+    except Exception:
+        return jsonify({"message": "ID de departamento inválido"}), 400
+    
+    departamento = db_departamentos.find_one({"_id": departamento_id_obj})
+    
+    if not departamento:
+        return jsonify({"message": "Departamento no encontrado"}), 404
+    
+    # Convertir ObjectId a string para la respuesta JSON
+    departamento["_id"] = str(departamento["_id"])
+    
+    # Serializar la respuesta
+    departamento_dump = json.dumps(departamento, default=json_util.default, ensure_ascii=False)
+    departamento_json = json.loads(departamento_dump.replace("\\", ""))
+    
+    return jsonify(departamento_json), 200
+
+@app.route("/departamentos/<string:departamento_id>", methods=["PUT"])
+@allow_cors
+@token_required
+def actualizar_departamento(user, departamento_id):
+    """
+    Endpoint para actualizar un departamento.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: path
+        name: departamento_id
+        required: true
+        description: ID del departamento a actualizar.
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
+      - in: body
+        name: body
+        required: true
+        description: Datos a actualizar del departamento.
+        schema:
+          type: object
+          properties:
+            nombre:
+              type: string
+              example: "Gestión de Proyectos Actualizado"
+            descripcion:
+              type: string
+              example: "Descripción actualizada"
+            codigo:
+              type: string
+              example: "GP"
+            activo:
+              type: boolean
+              example: true
+    responses:
+      200:
+        description: Departamento actualizado con éxito.
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Departamento actualizado con éxito"
+      404:
+        description: Departamento no encontrado.
+    """
+    data = request.get_json()
+    departamento = db_departamentos.find_one({"_id": ObjectId(departamento_id)})
+    if not departamento:
+        return jsonify({"message": "Departamento no encontrado"}), 404
+    
+    update_data = {}
+    if "nombre" in data:
+        update_data["nombre"] = data["nombre"]
+    if "descripcion" in data:
+        update_data["descripcion"] = data["descripcion"]
+    if "codigo" in data:
+        update_data["codigo"] = data["codigo"]
+    if "activo" in data:
+        update_data["activo"] = data["activo"]
+    
+    db_departamentos.update_one({"_id": ObjectId(departamento_id)}, {"$set": update_data})
+    return jsonify({"message": "Departamento actualizado con éxito"}), 200
+
+@app.route("/departamentos/<string:departamento_id>", methods=["DELETE"])
+@allow_cors
+@token_required
+def eliminar_departamento(user, departamento_id):
+    """
+    Endpoint para eliminar un departamento.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: path
+        name: departamento_id
+        required: true
+        description: ID del departamento a eliminar.
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
+    responses:
+      200:
+        description: Departamento eliminado con éxito.
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Departamento eliminado con éxito"
+      404:
+        description: Departamento no encontrado.
+    """
+    departamento = db_departamentos.find_one({"_id": ObjectId(departamento_id)})
+    if not departamento:
+        return jsonify({"message": "Departamento no encontrado"}), 404
+    
+    result = db_departamentos.delete_one({"_id": ObjectId(departamento_id)})
+    if result.deleted_count == 1:
+        return jsonify({"message": "Departamento eliminado con éxito"}), 200
+    else:
+        return jsonify({"message": "No se pudo eliminar el departamento"}), 400
+
 @app.route("/cambiar_rol_usuario", methods=["POST"])
 @allow_cors
-@validar_datos({"id": str, "nuevo_rol": bool})
+@validar_datos({"id": str, "rol": str})
 @token_required
 def cambiar_rol_usuario(user):
     """
@@ -488,12 +795,17 @@ def cambiar_rol_usuario(user):
         schema:
           type: object
           properties:
-            id_usuario:
+            id:
               type: string
               example: "64a12fabc123456789012345"
-            is_admin:
-              type: boolean
-              example: true
+            rol:
+              type: string
+              enum: [usuario, admin_departamento, super_admin]
+              example: "admin_departamento"
+            departamento_id:
+              type: string
+              required: false
+              example: "64a12fabc123456789012346"
     responses:
       200:
         description: Rol del usuario actualizado correctamente.
@@ -510,18 +822,118 @@ def cambiar_rol_usuario(user):
     """
     data = request.get_json()
     usuario_id = data.get("id")
-    nuevo_rol = data.get("nuevo_rol")
+    nuevo_rol = data.get("rol")
+    departamento_id = data.get("departamento_id")
+
+    # Validar que el rol sea uno de los permitidos
+    roles_permitidos = ["usuario", "admin_departamento", "super_admin"]
+    if nuevo_rol not in roles_permitidos:
+        return jsonify({"message": f"Rol inválido. Debe ser uno de: {', '.join(roles_permitidos)}"}), 400
 
     usuario = mongo.db.usuarios.find_one({"_id": ObjectId(usuario_id)})
     if not usuario:
         return jsonify({"message": "Usuario no encontrado"}), 404
 
+    update_data = {"rol": nuevo_rol}
+    
+    # Si se proporciona departamento_id, validar que existe
+    if departamento_id:
+        try:
+            departamento = db_departamentos.find_one({"_id": ObjectId(departamento_id)})
+            if not departamento:
+                return jsonify({"message": "Departamento no encontrado"}), 400
+            update_data["departamento_id"] = ObjectId(departamento_id)
+        except Exception:
+            return jsonify({"message": "ID de departamento inválido"}), 400
+    elif "departamento_id" in data and data["departamento_id"] is None:
+        # Permitir eliminar el departamento_id si se envía explícitamente como None
+        update_data["departamento_id"] = None
+
     mongo.db.usuarios.update_one(
         {"_id": ObjectId(usuario_id)},
-        {"$set": {"is_admin": nuevo_rol}}
+        {"$set": update_data}
     )
 
     return jsonify({"message": "Rol actualizado correctamente"}), 200
+
+@app.route("/contexto_departamento", methods=["GET"])
+@allow_cors
+@token_required
+def obtener_contexto_departamento(user):
+    """
+    Endpoint para obtener el contexto actual del departamento.
+    Solo disponible para super_admin. Retorna el departamento_id del contexto
+    si está activo, o null si no hay contexto activo.
+    ---
+    tags:
+      - Departamentos
+    parameters:
+      - in: header
+        name: X-Department-Context
+        required: false
+        description: ID del departamento para el contexto (solo para super_admin)
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
+    responses:
+      200:
+        description: Contexto del departamento obtenido con éxito.
+        schema:
+          type: object
+          properties:
+            departamento_id:
+              type: string
+              nullable: true
+              example: "64b8f3e2c9d1a2b3c4d5e6f7"
+            usando_contexto:
+              type: boolean
+              example: true
+            departamento:
+              type: object
+              nullable: true
+              properties:
+                _id:
+                  type: string
+                nombre:
+                  type: string
+                descripcion:
+                  type: string
+                codigo:
+                  type: string
+      403:
+        description: Solo super_admin puede usar este endpoint.
+    """
+    # Solo super_admin puede usar este endpoint
+    if user.get("role") != "super_admin":
+        return jsonify({"message": "Solo super_admin puede usar este endpoint"}), 403
+    
+    # Obtener el contexto del header
+    dept_context = request.headers.get("X-Department-Context")
+    usando_contexto = False
+    departamento = None
+    
+    if dept_context:
+        try:
+            dept_id_obj = ObjectId(dept_context.strip())
+            # Validar que el departamento existe
+            dept = db_departamentos.find_one({"_id": dept_id_obj})
+            if dept:
+                usando_contexto = True
+                departamento = {
+                    "_id": str(dept["_id"]),
+                    "nombre": dept.get("nombre", ""),
+                    "descripcion": dept.get("descripcion", ""),
+                    "codigo": dept.get("codigo", ""),
+                }
+        except Exception:
+            # Si hay error, no hay contexto válido
+            pass
+    
+    return jsonify({
+        "departamento_id": dept_context.strip() if dept_context and usando_contexto else None,
+        "usando_contexto": usando_contexto,
+        "departamento": departamento
+    }), 200
 
 @app.route("/asignar_rol", methods=["PATCH"])
 @token_required
@@ -565,42 +977,89 @@ def asignar_rol():
 
 
 @app.route("/crear_proyecto", methods=["POST"])
+@allow_cors
 @token_required
 @validar_datos(
     {"nombre": str, "descripcion": str, "fecha_inicio": str, "fecha_fin": str}
 )
 def crear_proyecto(user):
     """
-    Endpoint para asignar un rol a un usuario.
+    Endpoint para crear un nuevo proyecto.
     ---
     tags:
-      - Roles
+      - Proyectos
     parameters:
       - in: body
         name: body
         required: true
-        description: Datos para asignar el rol.
+        description: Datos del proyecto a crear.
         schema:
           type: object
           properties:
-            user_id:
+            nombre:
               type: string
+              example: "Proyecto de Desarrollo"
+            descripcion:
+              type: string
+              example: "Descripción del proyecto"
+            fecha_inicio:
+              type: string
+              example: "2025-01-01"
+            fecha_fin:
+              type: string
+              example: "2025-12-31"
+            departamento_id:
+              type: string
+              required: false
               example: "64b8f3e2c9d1a2b3c4d5e6f7"
-            rol_id:
-              type: string
-              example: "64b8f3e2c9d1a2b3c4d5e6f8"
+              description: ID del departamento al que pertenece el proyecto (opcional)
     responses:
-      200:
-        description: Rol asignado con éxito.
+      201:
+        description: Proyecto creado con éxito.
         schema:
           type: object
           properties:
             message:
               type: string
-              example: "Rol asignado con éxito"
+              example: "Proyecto creado con éxito"
+            _id:
+              type: string
+              example: "64b8f3e2c9d1a2b3c4d5e6f7"
+      400:
+        description: Error en los datos enviados o departamento no encontrado.
     """
     current_user = user["sub"]
     data = request.get_json()
+    
+    # Manejar departamento_id
+    departamento_id = None
+    
+    # Si se proporciona departamento_id en el body, validarlo
+    if "departamento_id" in data and data["departamento_id"]:
+        try:
+            dept_id_obj = ObjectId(data["departamento_id"])
+            # Validar que el departamento existe
+            departamento = db_departamentos.find_one({"_id": dept_id_obj})
+            if not departamento:
+                return jsonify({"message": "Departamento no encontrado"}), 400
+            departamento_id = dept_id_obj
+        except Exception:
+            return jsonify({"message": "ID de departamento inválido"}), 400
+    # Si no se proporciona, usar el departamento del usuario si tiene contexto o es admin_departamento
+    elif user.get("_using_dept_context") and "departamento_id" in user:
+        # Usuario super_admin con contexto de departamento
+        try:
+            departamento_id = ObjectId(user["departamento_id"])
+        except Exception:
+            pass
+    elif user.get("role") == "admin_departamento" and "departamento_id" in user:
+        # Usuario admin_departamento, usar su departamento
+        try:
+            departamento_id = ObjectId(user["departamento_id"])
+        except Exception:
+            pass
+    
+    # Preparar datos del proyecto
     data["miembros"] = []
     data["balance"] = 000
     data["balance_inicial"] = 000
@@ -612,6 +1071,11 @@ def crear_proyecto(user):
     data["show"] = {"status": False}
     data["owner"] = ObjectId(current_user)
     data["user"] = user
+    
+    # Asignar departamento_id si se determinó uno
+    if departamento_id:
+        data["departamento_id"] = departamento_id
+    
     project = db_proyectos.insert_one(data)
     message_log = "Usuario %s ha creado el proyecto" % user["nombre"]
     agregar_log(project.inserted_id, message_log)
@@ -1279,8 +1743,51 @@ def mostrar_proyectos(user):
         ]
     }
     dir(user)
-    if user["role"] == "admin":
-        query = {}
+    # Super admin puede ver todos los proyectos, a menos que tenga contexto de departamento
+    if user.get("role") == "super_admin":
+        # Si super_admin tiene contexto de departamento, filtrar como admin_departamento
+        if user.get("_using_dept_context") and "departamento_id" in user:
+            try:
+                dept_id = ObjectId(user["departamento_id"])
+                query = {
+                    "$or": [
+                        {"departamento_id": dept_id},  # Proyectos del departamento del contexto
+                        {"owner": user["sub"]},  # Proyectos que es dueño
+                        {
+                            "miembros": {
+                                "$elemMatch": {
+                                    "usuario._id.$oid": user["sub"]
+                                }
+                            }
+                        },  # Proyectos donde es miembro
+                    ]
+                }
+            except Exception:
+                # Si hay error con el ObjectId, mantener la query original (ver todos)
+                query = {}
+        else:
+            # Sin contexto, ver todos los proyectos
+            query = {}
+    # Admin de departamento puede ver proyectos de su departamento, además de los que es dueño o miembro
+    elif user.get("role") == "admin_departamento" and "departamento_id" in user:
+        try:
+            dept_id = ObjectId(user["departamento_id"])
+            query = {
+                "$or": [
+                    {"departamento_id": dept_id},  # Proyectos de su departamento
+                    {"owner": user["sub"]},  # Proyectos que es dueño
+                    {
+                        "miembros": {
+                            "$elemMatch": {
+                                "usuario._id.$oid": user["sub"]
+                            }
+                        }
+                    },  # Proyectos donde es miembro
+                ]
+            }
+        except Exception:
+            # Si hay error con el ObjectId, mantener la query original
+            pass
 
     # Optional: Projection to exclude password field
     projection = {"miembros.usuario.password": 0}  # Exclude password
@@ -2678,7 +3185,8 @@ def obtener_reporte_proyecto(id):
 
 @app.route('/dashboard_global', methods=['GET'])
 @allow_cors
-def resumen_general():
+@token_required
+def resumen_general(user):
     """
     Endpoint para obtener un resumen general del sistema.
     ---
@@ -2691,6 +3199,13 @@ def resumen_general():
         enum: [1m, 6m, 1y, all]
         default: 6m
         description: Rango de tiempo a mostrar.
+      - in: header
+        name: X-Department-Context
+        required: false
+        description: ID del departamento para el contexto (solo para super_admin)
+        schema:
+          type: string
+          example: "64b8f3e2c9d1a2b3c4d5e6f7"
     responses:
       200:
         description: Resumen general del sistema
@@ -2759,29 +3274,69 @@ def resumen_general():
     else:
       date_limit = None  # mostrar todo
 
+    # Determinar filtro de proyectos según el contexto del usuario
+    filtro_proyectos = {}
+    filtro_proyectos_ids = None  # Para filtrar acciones y documentos
+    
+    # Super admin puede ver todos los proyectos, a menos que tenga contexto de departamento
+    if user.get("role") == "super_admin":
+        # Si super_admin tiene contexto de departamento, filtrar como admin_departamento
+        if user.get("_using_dept_context") and "departamento_id" in user:
+            try:
+                dept_id = ObjectId(user["departamento_id"])
+                filtro_proyectos = {"departamento_id": dept_id}
+                # Obtener IDs de proyectos del departamento para filtrar acciones y documentos
+                proyectos_dept = list(db_proyectos.find(filtro_proyectos, {"_id": 1}))
+                filtro_proyectos_ids = [p["_id"] for p in proyectos_dept]
+            except Exception:
+                # Si hay error con el ObjectId, mantener sin filtro (ver todos)
+                pass
+    # Admin de departamento puede ver proyectos de su departamento
+    elif user.get("role") == "admin_departamento" and "departamento_id" in user:
+        try:
+            dept_id = ObjectId(user["departamento_id"])
+            filtro_proyectos = {"departamento_id": dept_id}
+            # Obtener IDs de proyectos del departamento para filtrar acciones y documentos
+            proyectos_dept = list(db_proyectos.find(filtro_proyectos, {"_id": 1}))
+            filtro_proyectos_ids = [p["_id"] for p in proyectos_dept]
+        except Exception:
+            # Si hay error con el ObjectId, mantener sin filtro
+            pass
+
     # Totales de ingresos y egresos
     filtro_fecha = {}
     if date_limit:
         filtro_fecha = { "created_at": { "$gte": date_limit } }
+    
+    # Filtrar acciones por proyectos del departamento si aplica
+    filtro_acciones = {**filtro_fecha}
+    if filtro_proyectos_ids:
+        filtro_acciones["project_id"] = {"$in": filtro_proyectos_ids}
+    
     ingresos = 0
     egresos = 0
-    for a in db_acciones.find(filtro_fecha):
+    for a in db_acciones.find(filtro_acciones):
         monto = a.get("amount", 0)
         if monto >= 0:
             ingresos += monto
         else:
             egresos += abs(monto)
 
-    # Categorías de proyectos
-    categorias = list(db_proyectos.aggregate([
+    # Categorías de proyectos (filtrar por departamento si aplica)
+    pipeline_categorias = []
+    if filtro_proyectos:
+        pipeline_categorias.append({"$match": filtro_proyectos})
+    pipeline_categorias.extend([
         {"$group": {"_id": "$categoria", "count": {"$sum": 1}}},
         {"$project": {"categoria": "$_id", "count": 1, "_id": 0}}
-    ]))
+    ])
+    categorias = list(db_proyectos.aggregate(pipeline_categorias))
+    
     # Encontrar ocurrencias de usuarios en proyectos
     conteo_usuarios = defaultdict(lambda: {"name": "", "projects": 0})
 
-    # Consulta todos los proyectos
-    proyectos = list(db_proyectos.find())
+    # Consulta proyectos (ya filtrados por departamento si aplica)
+    proyectos = list(db_proyectos.find(filtro_proyectos))
 
     for proyecto in proyectos:
         miembros = proyecto.get("miembros", [])
@@ -2797,17 +3352,31 @@ def resumen_general():
     # Transformar a arreglo final
     ocurrencias = [{"id": user_id, "name": info["name"], "projects": info["projects"]}
                   for user_id, info in conteo_usuarios.items()]
-    # Resumen global
+    
+    # Resumen global (filtrar por departamento si aplica)
+    filtro_documentos = {**filtro_fecha}
+    if filtro_proyectos_ids:
+        filtro_documentos["proyecto_id"] = {"$in": filtro_proyectos_ids}
+    
+    filtro_documentos_finalizados = {"status": "finished", **filtro_fecha}
+    if filtro_proyectos_ids:
+        filtro_documentos_finalizados["proyecto_id"] = {"$in": filtro_proyectos_ids}
+    
+    # Filtrar miembros: solo usuarios del departamento si hay contexto
+    filtro_usuarios = {}
+    if filtro_proyectos and "departamento_id" in filtro_proyectos:
+        filtro_usuarios = {"departamento_id": filtro_proyectos["departamento_id"]}
+    
     resumen = {
-        "proyectos": db_proyectos.count_documents({}),
-        "miembros": db_usuarios.count_documents({}),
-        "presupuestos": db_documentos.count_documents({**filtro_fecha}),
-        "presupuestos_finalizados": db_documentos.count_documents({"status": "finished", **filtro_fecha}),
+        "proyectos": db_proyectos.count_documents(filtro_proyectos),
+        "miembros": db_usuarios.count_documents(filtro_usuarios),
+        "presupuestos": db_documentos.count_documents(filtro_documentos),
+        "presupuestos_finalizados": db_documentos.count_documents(filtro_documentos_finalizados),
         "ocurrencias": ocurrencias,
-        "balance_total": sum(p.get("balance", 0) for p in db_proyectos.find(filtro_fecha))
+        "balance_total": sum(p.get("balance", 0) for p in proyectos)
     }
 
-    # Historial de saldo mensual
+    # Historial de saldo mensual (filtrar por proyectos del departamento si aplica)
     balance_acumulado = 0
     balanceHistory = []
 
@@ -2819,9 +3388,13 @@ def resumen_general():
         inicio_mes = datetime.strptime(mes, "%Y-%m")
         fin_mes = (inicio_mes + relativedelta(months=1))
 
-        movimientos = db_acciones.find({
+        filtro_movimientos = {
             "created_at": {"$gte": inicio_mes, "$lt": fin_mes}
-        })
+        }
+        if filtro_proyectos_ids:
+            filtro_movimientos["project_id"] = {"$in": filtro_proyectos_ids}
+
+        movimientos = db_acciones.find(filtro_movimientos)
 
         for m in movimientos:
             balance_acumulado += m.get("amount", 0)
