@@ -19,10 +19,12 @@ documents_bp = Blueprint('documents', __name__)
 def mostrar_documentos_proyecto(id):
     id = ObjectId(id)
     params = request.args
-    skip = int(params.get("page")) if params.get("page") else 0
+    page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
-    documentos = mongo.db.documentos.find({"project_id": id}).skip(skip * limit).limit(limit)
-    quantity = math.ceil(mongo.db.documentos.count_documents({"project_id": id}) / 10)
+    skip = page * limit  # Calcular skip basado en page y limit
+    documentos = mongo.db.documentos.find({"project_id": id}).skip(skip).limit(limit)
+    total_items = mongo.db.documentos.count_documents({"project_id": id})
+    quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(documentos)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))

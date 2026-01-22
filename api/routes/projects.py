@@ -295,12 +295,13 @@ def obtener_objetivos_especificos(_, proyecto_id):
 def acciones_proyecto(id):
     id = ObjectId(id)
     params = request.args
-    skip = int(params.get("page")) if params.get("page") else 0
+    page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
-    acciones = mongo.db.acciones.find({"project_id": id}).skip(skip * limit).limit(limit)
+    skip = page * limit  # Calcular skip basado en page y limit
+    acciones = mongo.db.acciones.find({"project_id": id}).skip(skip).limit(limit)
     acciones = map(map_to_doc, acciones)
-    quantity = mongo.db.acciones.count_documents({"project_id": id}) / 10
-    quantity = math.ceil(quantity)
+    total_items = mongo.db.acciones.count_documents({"project_id": id})
+    quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(acciones)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))
@@ -395,10 +396,12 @@ def finalizar_proyecto(user):
 def obtener_logs(id):
     id = ObjectId(id)
     params = request.args
-    skip = int(params.get("page")) if params.get("page") else 0
+    page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
-    acciones = mongo.db.logs.find({"id_proyecto": id}).skip(skip * limit).limit(limit)
-    quantity = math.ceil(mongo.db.logs.count_documents({"id_proyecto": id}) / 10)
+    skip = page * limit  # Calcular skip basado en page y limit
+    acciones = mongo.db.logs.find({"id_proyecto": id}).skip(skip).limit(limit)
+    total_items = mongo.db.logs.count_documents({"id_proyecto": id})
+    quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(acciones)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))
