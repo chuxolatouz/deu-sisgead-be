@@ -1,17 +1,20 @@
 
+import os
 from b2sdk.v2 import B2Api, InMemoryAccountInfo
 from io import BytesIO
 
-ACCOUNT_ID = "0054addcef284d30000000002"
-APPLICATION_KEY = "K005xSlLQhiwP7QZsQOXxe7k2HH+WHk"
-BUCKET_ID = "d4ea8d3dcc4e0ff288e40d13"
+ACCOUNT_ID = os.getenv("B2_ACCOUNT_ID")
+APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY")
+BUCKET_ID = os.getenv("B2_BUCKET_ID")
 BASE_B2_URL = "https://f005.backblazeb2.com/file"
-BUCKET_NAME="enii-ucv-1"
+BUCKET_NAME = os.getenv("B2_BUCKET_NAME")
 
 info = InMemoryAccountInfo()
 b2_api = B2Api(account_info=info)
 
 def auth_b2_account():
+    if not ACCOUNT_ID or not APPLICATION_KEY:
+        raise ValueError("Backblaze credentials not found in environment variables")
     b2_api.authorize_account("production", ACCOUNT_ID, APPLICATION_KEY)
     return b2_api
 

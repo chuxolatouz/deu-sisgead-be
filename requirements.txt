@@ -40,3 +40,4 @@ pytest==8.4.1
 pytest==8.4.1
 dotenv==0.9.9
 python-dotenv==1.1.1
+Flask-Mail
