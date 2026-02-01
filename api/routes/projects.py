@@ -21,6 +21,53 @@ projects_bp = Blueprint('projects', __name__)
     {"nombre": str, "descripcion": str, "fecha_inicio": str, "fecha_fin": str}
 )
 def crear_proyecto(user):
+    """
+    Crear nuevo proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - nombre
+            - descripcion
+            - fecha_inicio
+            - fecha_fin
+          properties:
+            nombre:
+              type: string
+              example: "Proyecto Construcción"
+            descripcion:
+              type: string
+            fecha_inicio:
+              type: string
+              format: date
+            fecha_fin:
+              type: string
+              format: date
+            categoria:
+              type: string
+            departamento_id:
+              type: string
+    responses:
+      201:
+        description: Proyecto creado
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+            _id:
+              type: string
+      400:
+        description: Categoría o departamento no encontrado
+    """
     current_user = user["sub"]
     data = request.get_json()
     
@@ -104,6 +151,33 @@ def crear_proyecto(user):
 @token_required
 @validar_datos({"nombre": str, "descripcion": str})
 def actualizar_proyecto(user, project_id):
+    """
+    Actualizar proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: project_id
+        type: string
+        required: true
+      - in: body
+        name: body
+        schema:
+          type: object
+          properties:
+            nombre:
+              type: string
+            descripcion:
+              type: string
+    responses:
+      200:
+        description: Proyecto actualizado
+      404:
+        description: Proyecto no encontrado
+    """
     data = request.get_json()
     project = mongo.db.proyectos.find_one({"_id": ObjectId(project_id)})
     if not project:
@@ -122,6 +196,41 @@ def actualizar_proyecto(user, project_id):
 @allow_cors
 @token_required
 def asignar_usuario_proyecto(user):
+    """
+    Asignar usuario a proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - proyecto_id
+            - usuario
+            - role
+          properties:
+            proyecto_id:
+              type: string
+            usuario:
+              type: object
+            role:
+              type: object
+              properties:
+                value:
+                  type: string
+                label:
+                  type: string
+    responses:
+      200:
+        description: Usuario asignado
+      400:
+        description: Usuario ya es miembro
+    """
     data = request.get_json()
     proyecto_id = data["proyecto_id"]
     usuario = data["usuario"]
@@ -155,6 +264,33 @@ def asignar_usuario_proyecto(user):
 @allow_cors
 @token_required
 def eliminar_usuario_proyecto(user):
+    """
+    Eliminar usuario de proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - proyecto_id
+            - usuario_id
+          properties:
+            proyecto_id:
+              type: string
+            usuario_id:
+              type: string
+    responses:
+      200:
+        description: Usuario eliminado del proyecto
+      400:
+        description: Usuario no es miembro
+    """
     data = request.get_json()
     proyecto_id = data["proyecto_id"]
     usuario_id = data["usuario_id"]
@@ -180,6 +316,31 @@ def eliminar_usuario_proyecto(user):
 @allow_cors
 @token_required
 def asignar_regla_distribucion(user):
+    """
+    Asignar regla de distribución a proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - proyecto_id
+            - regla_distribucion
+          properties:
+            proyecto_id:
+              type: string
+            regla_distribucion:
+              type: object
+    responses:
+      200:
+        description: Regla establecida
+    """
     data = request.get_json()
     proyecto_id = data["proyecto_id"]
     regla_distribucion = data["regla_distribucion"]
@@ -202,6 +363,32 @@ def asignar_regla_distribucion(user):
 @allow_cors
 @token_required
 def asignar_balance(user):
+    """
+    Asignar balance a proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - project_id
+            - balance
+          properties:
+            project_id:
+              type: string
+            balance:
+              type: string
+              description: Monto en formato string
+    responses:
+      200:
+        description: Balance asignado
+    """
     data = request.get_json()
     proyecto_id = data["project_id"]
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
@@ -233,6 +420,37 @@ def asignar_balance(user):
 @allow_cors
 @token_required
 def mostrar_proyectos(user):
+    """
+    Listar proyectos con paginación y búsqueda
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: query
+        name: page
+        type: integer
+        default: 0
+        description: Número de página (0-indexed)
+      - in: query
+        name: limit
+        type: integer
+        default: 10
+        description: Cantidad de resultados por página
+    responses:
+      200:
+        description: Lista de proyectos
+        schema:
+          type: object
+          properties:
+            request_list:
+              type: array
+              items:
+                type: object
+            count:
+              type: integer
+    """
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
@@ -285,6 +503,32 @@ def mostrar_proyectos(user):
 @projects_bp.route('/proyecto/<string:proyecto_id>/objetivos', methods=['GET'])
 @token_required
 def obtener_objetivos_especificos(_, proyecto_id):
+    """
+    Obtener objetivos específicos del proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: proyecto_id
+        type: string
+        required: true
+        description: ID del proyecto
+    responses:
+      200:
+        description: Lista de objetivos específicos
+        schema:
+          type: object
+          properties:
+            objetivos_especificos:
+              type: array
+              items:
+                type: string
+      404:
+        description: Proyecto no encontrado
+    """
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)}, {"objetivos_especificos": 1})
     if not proyecto:
         return jsonify({"message": "Proyecto no encontrado"}), 404
@@ -293,6 +537,38 @@ def obtener_objetivos_especificos(_, proyecto_id):
 @projects_bp.route("/proyecto/<string:id>/acciones", methods=["GET"])
 @allow_cors
 def acciones_proyecto(id):
+    """
+    Listar acciones/movimientos del proyecto
+    ---
+    tags:
+      - Proyectos
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+        description: ID del proyecto
+      - in: query
+        name: page
+        type: integer
+        default: 0
+      - in: query
+        name: limit
+        type: integer
+        default: 10
+    responses:
+      200:
+        description: Lista de acciones
+        schema:
+          type: object
+          properties:
+            request_list:
+              type: array
+              items:
+                type: object
+            count:
+              type: integer
+    """
     id = ObjectId(id)
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
@@ -310,6 +586,27 @@ def acciones_proyecto(id):
 @projects_bp.route("/proyecto/<string:id>", methods=["GET"])
 @allow_cors
 def proyecto(id):
+    """
+    Obtener detalles completos de un proyecto
+    ---
+    tags:
+      - Proyectos
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+        description: ID del proyecto
+    responses:
+      200:
+        description: Datos detallados del proyecto
+        schema:
+          type: object
+      400:
+        description: ID de proyecto inválido
+      404:
+        description: Proyecto no encontrado
+    """
     try:
         id = ObjectId(id.strip())
     except Exception:
@@ -334,6 +631,30 @@ def proyecto(id):
 @allow_cors
 @token_required
 def eliminar_proyecto(user):
+    """
+    Eliminar un proyecto
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - proyecto_id
+          properties:
+            proyecto_id:
+              type: string
+    responses:
+      200:
+        description: Proyecto eliminado exitosamente
+      404:
+        description: Proyecto no encontrado
+    """
     data = request.get_json()
     id = data["proyecto_id"]
     documento = mongo.db.proyectos.find_one({"_id": ObjectId(id)})
@@ -350,6 +671,30 @@ def eliminar_proyecto(user):
 @allow_cors
 @token_required
 def finalizar_proyecto(user):
+    """
+    Finalizar proyecto y generar acta
+    ---
+    tags:
+      - Proyectos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - proyecto_id
+          properties:
+            proyecto_id:
+              type: string
+    responses:
+      200:
+        description: Proyecto finalizado exitosamente
+      404:
+        description: Proyecto no encontrado
+    """
     data = request.get_json()
     proyecto_id = data.get("proyecto_id")
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
@@ -394,6 +739,35 @@ def finalizar_proyecto(user):
 @projects_bp.route("/proyecto/<string:id>/logs", methods=["GET"])
 @allow_cors
 def obtener_logs(id):
+    """
+    Listar logs de auditoría del proyecto
+    ---
+    tags:
+      - Proyectos
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+      - in: query
+        name: page
+        type: integer
+        default: 0
+      - in: query
+        name: limit
+        type: integer
+        default: 10
+    responses:
+      200:
+        description: Lista de logs
+        schema:
+          type: object
+          properties:
+            request_list:
+              type: array
+            count:
+              type: integer
+    """
     id = ObjectId(id)
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
@@ -410,6 +784,27 @@ def obtener_logs(id):
 @projects_bp.route("/proyecto/<string:id>/movimientos/descargar", methods=["GET"])
 @allow_cors
 def descargar_movimientos(id):
+    """
+    Descargar movimientos del proyecto
+    ---
+    tags:
+      - Proyectos
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+      - in: query
+        name: formato
+        type: string
+        enum: [csv, json]
+        default: csv
+    responses:
+      200:
+        description: Archivo de movimientos (CSV o JSON)
+      400:
+        description: Formato no válido
+    """
     id_proyecto = ObjectId(id)
     movimientos = mongo.db.acciones.find({"project_id": id_proyecto})
     movimientos_lista = list(movimientos)
@@ -425,6 +820,29 @@ def descargar_movimientos(id):
 @projects_bp.route("/proyecto/<string:id>/fin", methods=["GET"])
 @allow_cors
 def mostrar_finalizacion(id):
+    """
+    Obtener datos para el acta de finalización
+    ---
+    tags:
+      - Proyectos
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+    responses:
+      200:
+        description: Datos consolidados (logs, documentos, movimientos)
+        schema:
+          type: object
+          properties:
+            logs:
+              type: array
+            documentos:
+              type: array
+            movimientos:
+              type: array
+    """
     id = ObjectId(id)
     movs = mongo.db.acciones.find({"project_id": id})
     docs = mongo.db.documentos.find({"project_id": id})

@@ -12,3 +12,24 @@ class Config:
     MAIL_DEFAULT_SENDER = os.getenv("EMAIL_SENDER")
     MAIL_USE_TLS = False
     MAIL_USE_SSL = True
+    
+    # Swagger/Flasgger Config
+    SWAGGER = {
+        'title': 'DEU SISGEAD API',
+        'uiversion': 3,
+        'version': '1.0.0',
+        'description': 'API REST para el Sistema de Gestión Administrativa de Proyectos, Presupuestos, Usuarios y Departamentos',
+        'termsOfService': '',
+        'hide_top_bar': False,
+        'specs_route': '/apidocs/',
+        'static_url_path': '/flasgger_static',
+        'headers': [],
+        'specs': [
+            {
+                'endpoint': 'apispec',
+                'route': '/apispec.json',
+                'rule_filter': lambda rule: True,
+                'model_filter': lambda tag: True,
+            }
+        ]
+    }

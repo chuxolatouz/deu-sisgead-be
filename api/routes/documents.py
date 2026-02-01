@@ -17,6 +17,48 @@ documents_bp = Blueprint('documents', __name__)
 @documents_bp.route("/proyecto/<string:id>/documentos", methods=["GET"])
 @allow_cors
 def mostrar_documentos_proyecto(id):
+    """
+    Listar presupuestos de un proyecto
+    ---
+    tags:
+      - Presupuestos
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+        description: ID del proyecto
+      - in: query
+        name: page
+        type: integer
+        default: 0
+      - in: query
+        name: limit
+        type: integer
+        default: 10
+    responses:
+      200:
+        description: Lista de presupuestos
+        schema:
+          type: object
+          properties:
+            request_list:
+              type: array
+              items:
+                type: object
+                properties:
+                  _id:
+                    type: string
+                  descripcion:
+                    type: string
+                  monto:
+                    type: integer
+                  status:
+                    type: string
+                    enum: [new, finished]
+            count:
+              type: integer
+    """
     id = ObjectId(id)
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
@@ -34,6 +76,49 @@ def mostrar_documentos_proyecto(id):
 @allow_cors
 @token_required
 def crear_presupuesto(user):
+    """
+    Crear nuevo presupuesto con archivos
+    ---
+    tags:
+      - Presupuestos
+    security:
+      - Bearer: []
+    consumes:
+      - multipart/form-data
+    parameters:
+      - in: formData
+        name: proyecto_id
+        type: string
+        required: true
+      - in: formData
+        name: descripcion
+        type: string
+        required: true
+      - in: formData
+        name: monto
+        type: string
+        required: true
+        description: Monto en formato string (ej. "1000.00")
+      - in: formData
+        name: objetivo_especifico
+        type: string
+      - in: formData
+        name: files
+        type: file
+        description: Archivos adjuntos
+    responses:
+      201:
+        description: Presupuesto creado
+        schema:
+          type: object
+          properties:
+            mensaje:
+              type: string
+            _id:
+              type: string
+      400:
+        description: Campos requeridos faltantes
+    """
     project_id = request.form.get("proyecto_id")
     descripcion = request.form.get("descripcion")
     monto = request.form.get("monto")
@@ -89,6 +174,54 @@ def crear_presupuesto(user):
 @allow_cors
 @token_required
 def cerrar_presupuesto(user):
+    """
+    Cerrar presupuesto con aprobación
+    ---
+    tags:
+      - Presupuestos
+    security:
+      - Bearer: []
+    consumes:
+      - multipart/form-data
+    parameters:
+      - in: formData
+        name: proyecto_id
+        type: string
+        required: true
+      - in: formData
+        name: doc_id
+        type: string
+        required: true
+        description: ID del presupuesto
+      - in: formData
+        name: monto
+        type: string
+        required: true
+        description: Monto aprobado
+      - in: formData
+        name: description
+        type: string
+      - in: formData
+        name: referencia
+        type: string
+      - in: formData
+        name: monto_transferencia
+        type: string
+      - in: formData
+        name: banco
+        type: string
+      - in: formData
+        name: cuenta_contable
+        type: string
+      - in: formData
+        name: files
+        type: file
+    responses:
+      201:
+        description: Presupuesto cerrado
+      400:
+        description: Monto excede saldo disponible
+    """
     id = request.form.get("proyecto_id")
     doc_id = request.form.get("doc_id")
     data_balance = request.form.get("monto")
@@ -177,6 +310,36 @@ def cerrar_presupuesto(user):
 @allow_cors
 @token_required
 def eliminar_presupuesto_route(user): 
+    """
+    Eliminar presupuesto
+    ---
+    tags:
+      - Presupuestos
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - budget_id
+          properties:
+            budget_id:
+              type: string
+              description: ID del presupuesto
+            project_id:
+              type: string
+              description: ID del proyecto
+    responses:
+      200:
+        description: Presupuesto eliminado
+      401:
+        description: Presupuesto finalizado, no se puede eliminar
+      404:
+        description: Presupuesto no encontrado
+    """ 
     # The view_file output around 2399 was cut off. I will assume it maps to eliminating the budget logic seen in 2402.
     # The function name in 2402 is eliminar_presupuesto.
     data = request.get_json()

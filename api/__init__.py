@@ -1,8 +1,9 @@
 from flask import Flask
 import os
 from api.config import Config
-from api.extensions import mongo, bcrypt, cors, swagger, mail
+from api.extensions import mongo, bcrypt, cors, mail
 from api.util.common import CustomJSONEncoder
+from flasgger import Swagger
 
 def create_app(config_class=Config):
     app = Flask(__name__, template_folder=os.path.join(os.getcwd(), 'api', 'templates'))
@@ -15,7 +16,10 @@ def create_app(config_class=Config):
     # CORS(app, supports_credentials=True, resources={r"/*": {"origins": "http://localhost:3000"}})
     # Allowing all for now based on 'allow_cors' decorator usage or explicit config
     cors.init_app(app, supports_credentials=True, resources={r"/*": {"origins": "*"}}) # TODO: Restrict in production
-    swagger.init_app(app)
+    
+    # Initialize Swagger with config
+    swagger = Swagger(app, config=app.config.get('SWAGGER'))
+    
     mail.init_app(app)
 
     # Custom JSON Encoder

@@ -12,6 +12,61 @@ reports_bp = Blueprint('reports', __name__)
 @reports_bp.route('/reporte/proyecto/<string:proyecto_id>', methods=['GET'])
 @token_required
 def generar_reporte_proyecto(data, proyecto_id):
+    """
+    Generar reporte financiero de proyecto
+    ---
+    tags:
+      - Reportes
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: proyecto_id
+        type: string
+        required: true
+        description: ID del proyecto
+        example: "507f1f77bcf86cd799439011"
+    responses:
+      200:
+        description: Reporte generado exitosamente
+        schema:
+          type: object
+          properties:
+            saldo_inicial:
+              type: integer
+              description: Saldo inicial del proyecto en centavos
+            saldo_restante:
+              type: integer
+              description: Saldo restante en centavos
+            presupuestos_totales:
+              type: integer
+              description: Cantidad total de presupuestos
+            monto_total_presupuestado:
+              type: integer
+              description: Monto total presupuestado en centavos
+            monto_total_aprobado:
+              type: integer
+              description: Monto total aprobado en centavos
+            top_presupuestos:
+              type: array
+              description: Top 5 presupuestos aprobados
+              items:
+                type: object
+                properties:
+                  descripcion:
+                    type: string
+                  monto_aprobado:
+                    type: integer
+                  objetivo_especifico:
+                    type: string
+      404:
+        description: Proyecto no encontrado
+        schema:
+          type: object
+          properties:
+            error:
+              type: string
+    """
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
     if not proyecto:
         return jsonify({"error": "Proyecto no encontrado"}), 404
@@ -53,6 +108,68 @@ def generar_reporte_proyecto(data, proyecto_id):
 
 @reports_bp.route('/proyecto/<id>/reporte', methods=['GET'])
 def obtener_reporte_proyecto(id):
+    """
+    Obtener reporte de balance y egresos de proyecto
+    ---
+    tags:
+      - Reportes
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+        description: ID del proyecto
+        example: "507f1f77bcf86cd799439011"
+    responses:
+      200:
+        description: Reporte obtenido exitosamente
+        schema:
+          type: object
+          properties:
+            balance_history:
+              type: array
+              description: Historia de balance del proyecto
+              items:
+                type: object
+                properties:
+                  fecha:
+                    type: string
+                    format: date
+                    example: "2024-01-15"
+                  saldo:
+                    type: number
+                    description: Saldo en el momento
+            egresos_tipo:
+              type: array
+              description: Egresos agrupados por tipo
+              items:
+                type: object
+                properties:
+                  tipo:
+                    type: string
+                    description: Tipo de egreso
+                  monto:
+                    type: number
+                    description: Monto total del tipo
+            resumen:
+              type: object
+              description: Resumen adicional del proyecto
+      400:
+        description: ID inválido
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "ID de proyecto inválido"
+      404:
+        description: Proyecto no encontrado
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+    """
     try:
         project_id = ObjectId(id)
     except Exception:

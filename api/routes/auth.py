@@ -9,6 +9,59 @@ auth_bp = Blueprint('auth', __name__)
 @auth_bp.route("/registrar", methods=["POST"])
 @validar_datos({"nombre": str, "email": str, "password": str, "rol": str})
 def registrar():
+    """
+    Registrar un nuevo usuario
+    ---
+    tags:
+      - Autenticación
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - nombre
+            - email
+            - password
+            - rol
+          properties:
+            nombre:
+              type: string
+              description: Nombre del usuario
+              example: "Juan Pérez"
+            email:
+              type: string
+              format: email
+              description: Email del usuario
+              example: "juan.perez@example.com"
+            password:
+              type: string
+              format: password
+              description: Contraseña del usuario
+              example: "SecurePass123"
+            rol:
+              type: string
+              enum: ["usuario", "admin_departamento", "super_admin"]
+              description: Rol del usuario
+              example: "usuario"
+    responses:
+      201:
+        description: Usuario registrado con éxito
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Usuario registrado con éxito"
+      400:
+        description: El email ya está registrado o rol inválido
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+    """
     data = request.get_json()
     db_usuarios = mongo.db.usuarios
     
@@ -32,6 +85,61 @@ def registrar():
 @auth_bp.route("/login", methods=["POST"])
 @validar_datos({"email": str, "password": str})
 def login():
+    """
+    Iniciar sesión
+    ---
+    tags:
+      - Autenticación
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - email
+            - password
+          properties:
+            email:
+              type: string
+              format: email
+              description: Email del usuario
+              example: "juan.perez@example.com"
+            password:
+              type: string
+              format: password
+              description: Contraseña del usuario
+              example: "SecurePass123"
+    responses:
+      200:
+        description: Login exitoso
+        schema:
+          type: object
+          properties:
+            token:
+              type: string
+              description: JWT token de autenticación
+            email:
+              type: string
+            id:
+              type: string
+            nombre:
+              type: string
+            role:
+              type: string
+              enum: ["usuario", "admin_departamento", "super_admin"]
+            departamento_id:
+              type: string
+              description: ID del departamento (opcional)
+      401:
+        description: Credenciales inválidas
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Credenciales inválidas"
+    """
     data = request.get_json()
     db_usuarios = mongo.db.usuarios
     usuario = db_usuarios.find_one({"email": data["email"]})
@@ -63,6 +171,43 @@ def login():
 
 @auth_bp.route("/olvido_contraseña", methods=["POST"])
 def olvido_contraseña():
+    """
+    Recuperar contraseña olvidada
+    ---
+    tags:
+      - Autenticación
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - email
+          properties:
+            email:
+              type: string
+              format: email
+              description: Email del usuario registrado
+              example: "juan.perez@example.com"
+    responses:
+      200:
+        description: Email enviado exitosamente
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Se ha enviado un email electrónico para restablecer la contraseña"
+      404:
+        description: Email no registrado
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "El email electrónico no está registrado"
+    """
     data = request.get_json()
     db_usuarios = mongo.db.usuarios
     usuario = db_usuarios.find_one({"email": data["email"]})

@@ -13,6 +13,39 @@ rules_bp = Blueprint('rules', __name__)
 @rules_bp.route("/crear_solicitud_regla_fija", methods=["POST"])
 @token_required
 def crear_solicitud_regla_fija(user):
+    """
+    Crear solicitud de regla fija
+    ---
+    tags:
+      - Reglas de Distribución
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - name
+            - items
+          properties:
+            name:
+              type: string
+              example: "Regla de Distribución 2024"
+            items:
+              type: array
+              items:
+                type: object
+                properties:
+                  nombre_regla:
+                    type: string
+                  monto:
+                    type: number
+    responses:
+      200:
+        description: Solicitud creada
+    """
     data = request.get_json()
     solicitud_regla = {}
     items = data["items"]
@@ -29,6 +62,22 @@ def crear_solicitud_regla_fija(user):
 @rules_bp.route("/eliminar_solicitud_regla_fija/<string:id>", methods=["POST"])
 @allow_cors
 def eliminar_solicitud_regla_fija(id):
+    """
+    Eliminar solicitud de regla fija
+    ---
+    tags:
+      - Reglas de Distribución
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+    responses:
+      200:
+        description: Solicitud eliminada
+      400:
+        description: No se pudo eliminar
+    """
     query = {"_id": ObjectId(id)}
     result = mongo.db.solicitudes.delete_one(query)
     if result.deleted_count == 1:
@@ -39,6 +88,33 @@ def eliminar_solicitud_regla_fija(id):
 @rules_bp.route("/completar_solicitud_regla_fija/<string:id>", methods=["POST"])
 @allow_cors
 def completar_solicitud_regla_fija(id):
+    """
+    Completar o rechazar solicitud de regla
+    ---
+    tags:
+      - Reglas de Distribución
+    parameters:
+      - in: path
+        name: id
+        type: string
+        required: true
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - resolution
+          properties:
+            resolution:
+              type: string
+              enum: ["completed", "rejected"]
+    responses:
+      200:
+        description: Solicitud actualizada
+      400:
+        description: No se pudo actualizar
+    """
     data = request.get_json()
     resolution = data["resolution"]
     query = {"_id": ObjectId(id)}
@@ -52,6 +128,33 @@ def completar_solicitud_regla_fija(id):
 @allow_cors
 @token_required
 def mostrar_reglas_fijas(user):
+    """
+    Listar reglas fijas completadas
+    ---
+    tags:
+      - Reglas de Distribución
+    security:
+      - Bearer: []
+    responses:
+      200:
+        description: Lista de reglas
+        schema:
+          type: object
+          properties:
+            request_list:
+              type: array
+              items:
+                type: object
+                properties:
+                  _id:
+                    type: string
+                  nombre:
+                    type: string
+                  reglas:
+                    type: array
+                  status:
+                    type: string
+    """
     list_request = mongo.db.solicitudes.find({"status": "completed"})
     list_cursor = list(list_request)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
@@ -62,6 +165,35 @@ def mostrar_reglas_fijas(user):
 @allow_cors
 @token_required
 def asignar_regla_fija(user):
+    """
+    Asignar regla fija a proyecto
+    ---
+    tags:
+      - Reglas de Distribución
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - proyecto_id
+            - regla_id
+          properties:
+            proyecto_id:
+              type: string
+            regla_id:
+              type: string
+    responses:
+      200:
+        description: Regla asignada
+      400:
+        description: Proyecto sin balance
+      404:
+        description: Proyecto o regla no encontrado
+    """
     data = request.get_json()
     proyecto_id = data["proyecto_id"]
     regla_id = data["regla_id"]
@@ -112,6 +244,33 @@ def asignar_regla_fija(user):
 @allow_cors
 @token_required
 def mostrar_solicitudes(user):
+    """
+    Listar solicitudes con paginación
+    ---
+    tags:
+      - Reglas de Distribución
+    security:
+      - Bearer: []
+    parameters:
+      - in: query
+        name: page
+        type: integer
+        default: 0
+      - in: query
+        name: limit
+        type: integer
+        default: 10
+    responses:
+      200:
+        description: Lista de solicitudes
+        schema:
+          type: object
+          properties:
+            request_list:
+              type: array
+            count:
+              type: integer
+    """
     params = request.args
     skip = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10

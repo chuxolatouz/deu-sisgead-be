@@ -78,19 +78,79 @@ def send_email_notification_thread(app, subject, recipient, template_name=None, 
 @notifications_bp.route("/send-notification", methods=["POST"])
 def send_notification():
     """
-    Endpoint para enviar notificaciones por email.
-    
-    Parámetros requeridos:
-    - recipient: Email del destinatario
-    - subject: Asunto del email
-    
-    Parámetros opcionales (uno de los dos es requerido):
-    - template: Nombre del template HTML (ej: "notificaciones.html")
-    - body: Contenido directo del email (texto o HTML)
-    
-    - variables: Diccionario con variables para el template (solo si se usa template)
-    - is_html: Boolean indicando si el body es HTML (default: True)
-    - sender: Email del remitente (opcional, usa MAIL_DEFAULT_SENDER por defecto)
+    Enviar notificación por email
+    ---
+    tags:
+      - Notificaciones
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - recipient
+            - subject
+          properties:
+            recipient:
+              type: string
+              format: email
+              description: Email del destinatario
+              example: "usuario@example.com"
+            subject:
+              type: string
+              description: Asunto del email
+              example: "Actualización de Proyecto"
+            template:
+              type: string
+              description: Nombre del template HTML (ej. "notificaciones.html")
+              example: "notificaciones.html"
+            body:
+              type: string
+              description: Contenido directo del email (usar si no se usa template)
+              example: "<h1>Hola</h1><p>Este es un mensaje importante.</p>"
+            variables:
+              type: object
+              description: Variables para el template (solo si se usa template)
+              example:
+                titulo: "Notificación Importante"
+                mensaje: "Su proyecto ha sido aprobado"
+            is_html:
+              type: boolean
+              description: Indica si el body es HTML
+              default: true
+            sender:
+              type: string
+              format: email
+              description: Email del remitente (opcional)
+    responses:
+      200:
+        description: Email en cola para envío
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "Email en cola para envío"
+            recipient:
+              type: string
+            subject:
+              type: string
+      400:
+        description: Datos inválidos
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
+              example: "El campo 'recipient' es requerido"
+      500:
+        description: Error del servidor
+        schema:
+          type: object
+          properties:
+            message:
+              type: string
     """
     data = request.get_json()
     
