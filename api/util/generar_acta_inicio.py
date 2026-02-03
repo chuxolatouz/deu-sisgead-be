@@ -25,7 +25,7 @@ def generar_acta_inicio_pdf(proyecto):
             <p><span class="bold">Nombre del Proyecto:</span> {{ nombre }}</p>
             <p><span class="bold">Descripción:</span> {{ descripcion }}</p>
             <p><span class="bold">Fecha de Inicio:</span> {{ fecha }}</p>
-            <p><span class="bold">Balance Inicial:</span> ${{ balance }}</p>
+            <p><span class="bold">Balance Inicial:</span> Bs. {{ balance }}</p>
         </div>
         <div class="seccion">
             <h2>Objetivo General</h2>

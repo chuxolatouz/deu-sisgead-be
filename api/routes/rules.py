@@ -228,7 +228,7 @@ def asignar_regla_fija(user):
             "created_at": datetime.utcnow()
         }
         mongo.db.acciones.insert_one(data_acciones)
-        message_log = f'{user["nombre"]} asigno la regla: {regla["nombre"]} con el item {x["nombre_regla"]} con un monto de ${int_to_string(x["monto"])}'
+        message_log = f'{user["nombre"]} asigno la regla: {regla["nombre"]} con el item {x["nombre_regla"]} con un monto de Bs. {int_to_string(x["monto"])}'
         agregar_log(proyecto_id, message_log)
 
     new_status, _ = actualizar_pasos(proyecto["status"], 5)

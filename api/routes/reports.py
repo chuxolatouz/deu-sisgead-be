@@ -1,7 +1,7 @@
 from flask import Blueprint, request, jsonify
 from bson import ObjectId, json_util
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 
 from api.extensions import mongo
@@ -206,3 +206,167 @@ def obtener_reporte_proyecto(id):
         "egresos_tipo": egresos_tipo,
         "resumen": {} # Placeholder as original code was cut off in my view
     }), 200
+
+@reports_bp.route('/dashboard_global', methods=['GET'])
+@token_required
+def dashboard_global(user):
+    """
+    Dashboard global con estadísticas consolidadas
+    ---
+    tags:
+      - Reportes
+    security:
+      - Bearer: []
+    parameters:
+      - in: query
+        name: range
+        type: string
+        default: 6m
+        description: Rango de tiempo (1m, 3m, 6m, 1y)
+    responses:
+      200:
+        description: Estadísticas generales obtenidas
+        schema:
+          type: object
+          properties:
+            balanceHistory:
+              type: array
+            categorias:
+              type: array
+            resumen:
+              type: object
+            totales:
+              type: object
+            usuarios:
+              type: integer
+    """
+    # Determine the range of dates
+    range_param = request.args.get('range', '6m')
+    now = datetime.now()
+    if range_param == '1m':
+        start_date = now - timedelta(days=30)
+    elif range_param == '3m':
+        start_date = now - timedelta(days=90)
+    elif range_param == '1y':
+        start_date = now - timedelta(days=365)
+    else:
+        start_date = now - timedelta(days=182)
+
+    # Determine query based on user role and context
+    query = {}
+    if user.get("role") == "admin_departamento" or user.get("_using_dept_context"):
+        if "departamento_id" in user:
+            query["departamento_id"] = ObjectId(user["departamento_id"])
+    elif user.get("role") == "super_admin":
+        pass
+    else:
+        # Standard user: only where they are owner or member
+        query = {
+            "$or": [
+                {"owner": ObjectId(user["sub"])},
+                {"miembros.usuario._id.$oid": user["sub"]}
+            ]
+        }
+
+    projects = list(mongo.db.proyectos.find(query))
+    project_ids = [p["_id"] for p in projects]
+
+    # Calculate Resumen
+    total_proyectos = len(projects)
+    
+    # Miembros (unique)
+    miembros_set = set()
+    for p in projects:
+        for m in p.get("miembros", []):
+            try:
+                if isinstance(m.get("usuario"), dict):
+                    # Check for both formats ($oid and direct string)
+                    u_id = m["usuario"].get("_id")
+                    if isinstance(u_id, dict) and "$oid" in u_id:
+                        miembros_set.add(u_id["$oid"])
+                    else:
+                        miembros_set.add(str(u_id))
+            except:
+                pass
+    total_miembros = len(miembros_set)
+
+    # Presupuestos
+    total_presupuestos = mongo.db.documentos.count_documents({"proyecto_id": {"$in": project_ids}})
+    total_presupuestos_finalizados = mongo.db.documentos.count_documents({
+        "proyecto_id": {"$in": project_ids},
+        "status": "finished"
+    })
+
+    # Ocurrencias (Participation in top projects)
+    user_counts = defaultdict(int)
+    for p in projects:
+        for m in p.get("miembros", []):
+            try:
+                name = m.get("usuario", {}).get("nombre", "Usuario Desconocido")
+                user_counts[name] += 1
+            except:
+                pass
+    ocurrencias = [{"name": name, "projects": count} for name, count in sorted(user_counts.items(), key=lambda x: x[1], reverse=True)[:10]]
+
+    # Totales (Ingresos/Egresos)
+    acciones = list(mongo.db.acciones.find({"project_id": {"$in": project_ids}}))
+    ingresos = sum(a.get("amount", 0) for a in acciones if a.get("amount", 0) > 0) / 100
+    egresos = abs(sum(a.get("amount", 0) for a in acciones if a.get("amount", 0) < 0)) / 100
+
+    # Categorias
+    categorias_map = {c["_id"]: c.get("label", "Sin Categoría") for c in mongo.db.categorias.find()}
+    cat_counts = defaultdict(int)
+    for p in projects:
+        cat_id = p.get("categoria")
+        if cat_id:
+            label = categorias_map.get(cat_id, "Desconocida")
+            cat_counts[label] += 1
+        else:
+            cat_counts["Sin Categoría"] += 1
+    categorias_data = [{"categoria": k, "count": v} for k, v in cat_counts.items()]
+
+    # Balance History (Consolidated)
+    daily_amounts = defaultdict(float)
+    for a in acciones:
+        if "created_at" in a:
+            # Handle both datetime objects and strings
+            if isinstance(a["created_at"], datetime):
+                dt = a["created_at"]
+            else:
+                try:
+                    dt = datetime.fromisoformat(str(a["created_at"]).replace('Z', '+00:00'))
+                except:
+                    continue
+            
+            date_str = dt.strftime("%Y-%m-%d")
+            daily_amounts[date_str] += a.get("amount", 0) / 100
+
+    sorted_dates = sorted(daily_amounts.keys())
+    running_total = 0
+    balance_history = []
+    for d in sorted_dates:
+        running_total += daily_amounts[d]
+        if datetime.strptime(d, "%Y-%m-%d") >= start_date:
+            balance_history.append({"fecha": d, "saldo": running_total})
+
+    # Usuarios Totales
+    total_usuarios = mongo.db.usuarios.count_documents({})
+
+    response = {
+        "balanceHistory": balance_history,
+        "categorias": categorias_data,
+        "resumen": {
+            "proyectos": total_proyectos,
+            "miembros": total_miembros,
+            "presupuestos": total_presupuestos,
+            "presupuestos_finalizados": total_presupuestos_finalizados,
+            "ocurrencias": ocurrencias
+        },
+        "totales": {
+            "ingresos": ingresos,
+            "egresos": egresos
+        },
+        "usuarios": total_usuarios
+    }
+
+    return jsonify(response), 200

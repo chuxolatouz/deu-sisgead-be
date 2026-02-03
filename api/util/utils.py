@@ -23,6 +23,14 @@ def int_to_string(int_number):
     return string_float
 
 
+def int_to_float(int_number):
+    """
+    Convierte entero (centavos) a float para envío JSON.
+    Ej: 100000 → 1000.00
+    """
+    return round(float(int_number) / 100, 2)
+
+
 def string_to_int(string_float):
     """
     Recibe un string que representa un número en formato de punto flotante.

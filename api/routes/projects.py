@@ -8,7 +8,7 @@ from io import BytesIO
 from api.extensions import mongo
 from api.util.decorators import token_required, allow_cors, validar_datos
 from api.util.common import agregar_log
-from api.util.utils import string_to_int, int_to_string, actualizar_pasos, generar_csv, generar_json, map_to_doc
+from api.util.utils import string_to_int, int_to_string, int_to_float, actualizar_pasos, generar_csv, generar_json, map_to_doc
 from api.util.generar_acta_finalizacion import generar_acta_finalizacion_pdf
 from api.util.backblaze import upload_file
 
@@ -411,7 +411,7 @@ def asignar_balance(user):
         "created_at": datetime.utcnow()
     }
     mongo.db.acciones.insert_one(data_acciones)
-    message_log = f'{user["nombre"]} agrego balance al proyecto por un monto de: ${int_to_string(data_balance)}'
+    message_log = f'{user["nombre"]} agrego balance al proyecto por un monto de: Bs. {int_to_string(data_balance)}'
     agregar_log(proyecto_id, message_log)
 
     return jsonify({"message": "Balance asignado con éxito"}), 200
@@ -617,8 +617,8 @@ def proyecto(id):
         return jsonify({"error": "proyecto no encontrado"}), 404
 
     proyecto["_id"] = str(proyecto["_id"])
-    balance = int_to_string(proyecto["balance"])
-    balance_inicial = int_to_string(proyecto["balance_inicial"])
+    balance = int_to_float(proyecto["balance"])
+    balance_inicial = int_to_float(proyecto["balance_inicial"])
     proyecto["balance"] = balance
     proyecto["owner"] = str(proyecto["owner"])
     proyecto["balance_inicial"] = balance_inicial

@@ -18,10 +18,10 @@ documents_bp = Blueprint('documents', __name__)
 @allow_cors
 def mostrar_documentos_proyecto(id):
     """
-    Listar presupuestos de un proyecto
+    Listar actividades de un proyecto
     ---
     tags:
-      - Presupuestos
+      - Actividades
     parameters:
       - in: path
         name: id
@@ -38,7 +38,7 @@ def mostrar_documentos_proyecto(id):
         default: 10
     responses:
       200:
-        description: Lista de presupuestos
+        description: Lista de actividades
         schema:
           type: object
           properties:
@@ -77,10 +77,10 @@ def mostrar_documentos_proyecto(id):
 @token_required
 def crear_presupuesto(user):
     """
-    Crear nuevo presupuesto con archivos
+    Crear nueva actividad con archivos
     ---
     tags:
-      - Presupuestos
+      - Actividades
     security:
       - Bearer: []
     consumes:
@@ -108,7 +108,7 @@ def crear_presupuesto(user):
         description: Archivos adjuntos
     responses:
       201:
-        description: Presupuesto creado
+        description: Actividad creada
         schema:
           type: object
           properties:
@@ -163,9 +163,9 @@ def crear_presupuesto(user):
     result = mongo.db.documentos.insert_one(presupuesto)
 
     if not result.acknowledged:
-        return jsonify({"error": "Error saving presupuesto"}), 500
+        return jsonify({"error": "Error saving actividad"}), 500
 
-    message_log = f'{user["nombre"]} agrego el presupuesto {descripcion} con un monto de ${monto}'
+    message_log = f'{user["nombre"]} agrego la actividad {descripcion} con un monto de Bs. {monto}'
     agregar_log(project_id, message_log)
 
     return jsonify({"mensaje": "Archivos subidos exitosamente", "_id": str(result.inserted_id)}), 201
@@ -175,10 +175,10 @@ def crear_presupuesto(user):
 @token_required
 def cerrar_presupuesto(user):
     """
-    Cerrar presupuesto con aprobación
+    Cerrar actividad con aprobación
     ---
     tags:
-      - Presupuestos
+      - Actividades
     security:
       - Bearer: []
     consumes:
@@ -192,7 +192,7 @@ def cerrar_presupuesto(user):
         name: doc_id
         type: string
         required: true
-        description: ID del presupuesto
+        description: ID de la actividad
       - in: formData
         name: monto
         type: string
@@ -218,7 +218,7 @@ def cerrar_presupuesto(user):
         type: file
     responses:
       201:
-        description: Presupuesto cerrado
+        description: Actividad cerrada
       400:
         description: Monto excede saldo disponible
     """
@@ -295,7 +295,7 @@ def cerrar_presupuesto(user):
         },
     )
 
-    message_log = f'{user["nombre"]} cerro el presupuesto {data_descripcion} con un monto de ${int_to_string(data_balance_int)}'
+    message_log = f'{user["nombre"]} cerro la actividad {data_descripcion} con un monto de Bs. {int_to_string(data_balance_int)}'
     agregar_log(id, message_log)
 
     return jsonify({"mensaje": "proyecto ajustado exitosamente"}), 201
@@ -311,10 +311,10 @@ def cerrar_presupuesto(user):
 @token_required
 def eliminar_presupuesto_route(user): 
     """
-    Eliminar presupuesto
+    Eliminar actividad
     ---
     tags:
-      - Presupuestos
+      - Actividades
     security:
       - Bearer: []
     parameters:
@@ -328,17 +328,17 @@ def eliminar_presupuesto_route(user):
           properties:
             budget_id:
               type: string
-              description: ID del presupuesto
+              description: ID de la actividad
             project_id:
               type: string
               description: ID del proyecto
     responses:
       200:
-        description: Presupuesto eliminado
+        description: Actividad eliminada
       401:
-        description: Presupuesto finalizado, no se puede eliminar
+        description: Actividad finalizada, no se puede eliminar
       404:
-        description: Presupuesto no encontrado
+        description: Actividad no encontrada
     """ 
     # The view_file output around 2399 was cut off. I will assume it maps to eliminating the budget logic seen in 2402.
     # The function name in 2402 is eliminar_presupuesto.
@@ -353,15 +353,15 @@ def eliminar_presupuesto_route(user):
 
     documento = mongo.db.documentos.find_one({"_id": ObjectId(presupuesto_id)})
     if documento is None:
-        return jsonify({"message": "Presupuesto no encontrado"}), 404
+        return jsonify({"message": "Actividad no encontrada"}), 404
 
     if documento["status"] == "finished":
-        return jsonify({"mensaje": "Presupuesto esta finalizado, no se puede eliminar"}), 401
+        return jsonify({"mensaje": "Actividad esta finalizada, no se puede eliminar"}), 401
     
     result = mongo.db.documentos.delete_one({"_id": ObjectId(presupuesto_id)})
     if result.deleted_count == 1:
-        message_log = f'{user["nombre"]} elimino el presupuesto {documento["descripcion"]} con un monto de ${int_to_string(documento["monto"])}'
+        message_log = f'{user["nombre"]} elimino la actividad {documento["descripcion"]} con un monto de Bs. {int_to_string(documento["monto"])}'
         agregar_log(project_id, message_log) # project_id passed in body
-        return jsonify({"message": "Presupuesto eliminada con éxito"}), 200
+        return jsonify({"message": "Actividad eliminada con éxito"}), 200
     else:
         return jsonify({"message": "No se pudo eliminar"}), 400

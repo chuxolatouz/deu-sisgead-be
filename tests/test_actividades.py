@@ -4,7 +4,7 @@ from io import BytesIO
 from api.index import db_documentos
 from api.index import app
 
-class PresupuestoTestCase(unittest.TestCase):
+class ActividadTestCase(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
         self.client.testing = True
@@ -27,10 +27,10 @@ class PresupuestoTestCase(unittest.TestCase):
         self.token = res.get_json().get("token")
         self.auth_headers = {"Authorization": f"Bearer {self.token}"}
 
-        # Crear un proyecto para asociar al presupuesto
+        # Crear un proyecto para asociar a la actividad
         proyecto = {
-            "nombre": "Proyecto Presupuesto Test",
-            "descripcion": "Proyecto usado para test de presupuesto.",
+            "nombre": "Proyecto Actividad Test",
+            "descripcion": "Proyecto usado para test de actividad.",
             "fecha_inicio": datetime.now(timezone.utc),
             "fecha_fin": datetime.now(timezone.utc)
         }
@@ -42,22 +42,22 @@ class PresupuestoTestCase(unittest.TestCase):
             "balance": 10000
         }, headers=self.auth_headers)
 
-    def test_01_crear_presupuesto(self):
-        presupuesto = {
+    def test_01_crear_actividad(self):
+        actividad = {
             "proyecto_id": self.proyecto_id,
             "monto": 5000,
-            "descripcion": "Presupuesto inicial de prueba"
+            "descripcion": "Actividad inicial de prueba"
         }
         file_data = {
             "files": (BytesIO(b"contenido de prueba"), "prueba.pdf")
         }
         form_data = {
             "proyecto_id": self.proyecto_id,
-            "descripcion": "Presupuesto con archivo",
+            "descripcion": "Actividad con archivo",
             "monto": "2000.00",
 
         }
-        print("Presupuesto a crear:", presupuesto)
+        print("Actividad a crear:", actividad)
         res = self.client.post(
             "/documento_crear",
             data={**form_data, **file_data},
@@ -70,11 +70,11 @@ class PresupuestoTestCase(unittest.TestCase):
         self.assertIn("mensaje", data)
         self.assertEqual(data["mensaje"], "Archivos subidos exitosamente")
 
-    def test_02_cerrar_presupuesto(self):
+    def test_02_cerrar_actividad(self):
         # Primero crear el documento
         crear_data = {
             "proyecto_id": self.proyecto_id,
-            "descripcion": "Presupuesto para cerrar",
+            "descripcion": "Actividad para cerrar",
             "monto": "100",
             "objetivo_especifico": "Compra"
         }
@@ -97,10 +97,10 @@ class PresupuestoTestCase(unittest.TestCase):
         
         res2 = self.client.patch("/asignar_balance", json=balance, headers=self.auth_headers)
         self.assertEqual(res2.status_code, 200)
-        # Buscar el doc_id del presupuesto recién creado
+        # Buscar el doc_id de la actividad recién creada
         
 
-        doc = db_documentos.find_one({"descripcion": "Presupuesto para cerrar"})
+        doc = db_documentos.find_one({"descripcion": "Actividad para cerrar"})
         self.assertIsNotNone(doc)
         doc_id = str(doc["_id"])
 
@@ -125,18 +125,18 @@ class PresupuestoTestCase(unittest.TestCase):
             headers=self.auth_headers,
             content_type='multipart/form-data'
         )
-        print("Response from cerrar presupuesto:", res.get_json())
+        print("Response from cerrar actividad:", res.get_json())
         self.assertEqual(res.status_code, 201)
         data = res.get_json()
         self.assertIn("mensaje", data)
         self.assertEqual(data["mensaje"], "proyecto ajustado exitosamente")
 
 
-    def test_03_cerrar_presupuesto_erroneo(self):
+    def test_03_cerrar_actividad_erroneo(self):
         # Primero crear el documento
         crear_data = {
             "proyecto_id": self.proyecto_id,
-            "descripcion": "Presupuesto para cerrar",
+            "descripcion": "Actividad para cerrar",
             "monto": "1000.00",
             "objetivo_especifico": "Compra"
         }
@@ -148,10 +148,10 @@ class PresupuestoTestCase(unittest.TestCase):
         )
         self.assertEqual(res.status_code, 201)
 
-        # Buscar el doc_id del presupuesto recién creado
+        # Buscar el doc_id de la actividad recién creada
         
 
-        doc = db_documentos.find_one({"descripcion": "Presupuesto para cerrar"})
+        doc = db_documentos.find_one({"descripcion": "Actividad para cerrar"})
         self.assertIsNotNone(doc)
         doc_id = str(doc["_id"])
 
@@ -176,7 +176,7 @@ class PresupuestoTestCase(unittest.TestCase):
             headers=self.auth_headers,
             content_type='multipart/form-data'
         )
-        print("Response from cerrar presupuesto:", res.get_json())
+        print("Response from cerrar actividad:", res.get_json())
         self.assertEqual(res.status_code, 400)
         data = res.get_json()
         self.assertIn("error", data)
