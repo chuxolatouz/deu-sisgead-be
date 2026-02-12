@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, Response, current_app
 from bson import ObjectId, json_util
 import json
 import math
@@ -13,6 +13,27 @@ from api.util.generar_acta_finalizacion import generar_acta_finalizacion_pdf
 from api.util.backblaze import upload_file
 
 projects_bp = Blueprint('projects', __name__)
+PLACEHOLDER = "(POR DEFINIR)"
+
+
+def _sanitize_filename(value):
+    safe = "".join(ch for ch in (value or "proyecto") if ch.isalnum() or ch in ("-", "_"))
+    return safe or "proyecto"
+
+
+def _get_project_or_404(project_id):
+    try:
+        object_id = ObjectId(project_id.strip())
+    except Exception:
+        return None, (jsonify({"message": "ID de proyecto inválido"}), 400)
+
+    project = mongo.db.proyectos.find_one({"_id": object_id})
+    if not project:
+        return None, (jsonify({"message": "Proyecto no encontrado"}), 404)
+    return project, None
+
+
+
 
 @projects_bp.route("/crear_proyecto", methods=["POST"])
 @allow_cors
@@ -853,3 +874,5 @@ def mostrar_finalizacion(id):
     logs_json = json.loads(json_util.dumps(list(logs)).replace("\\", ""))
 
     return jsonify(logs=logs_json, documentos=docs_json, movimientos=movs_json), 200
+
+
