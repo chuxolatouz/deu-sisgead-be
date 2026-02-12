@@ -1,4 +1,12 @@
 import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+# Cargar .env de la raíz del backend antes de evaluar variables de Config.
+_backend_root = Path(__file__).resolve().parents[1]
+load_dotenv(_backend_root / ".env")
 
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev_key_fallback")
