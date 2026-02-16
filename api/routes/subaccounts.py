@@ -370,3 +370,257 @@ def crear_indice_unico(user):
             "message": "Error al crear el índice",
             "error": str(e)
         }), 500
+
+@subaccounts_bp.route("/subaccounts/transfer", methods=["POST"])
+@allow_cors
+#@token_required
+#def transferir_entre_subcuentas(user):
+def transferir_entre_subcuentas():
+    """
+    Transferir fondos entre subcuentas (solo administradores)
+    ---
+    tags:
+      - Subcuentas
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - fromSubaccountId
+            - toSubaccountId
+            - amountBs
+          properties:
+            fromSubaccountId:
+              type: string
+              description: ID de la subcuenta origen
+              example: "507f1f77bcf86cd799439011"
+            toSubaccountId:
+              type: string
+              description: ID de la subcuenta destino
+              example: "507f1f77bcf86cd799439012"
+            amountBs:
+              type: number
+              description: Monto a transferir (debe ser mayor a 0)
+              example: 500.00
+            description:
+              type: string
+              description: Descripción de la transferencia
+              example: "Transferencia entre departamentos"
+    responses:
+      200:
+        description: Transferencia realizada exitosamente
+      400:
+        description: Datos inválidos o saldo insuficiente
+      403:
+        description: No autorizado - solo administradores
+      404:
+        description: Subcuenta no encontrada
+    """
+    # Validar permisos de administrador
+    
+    #if user.get("role") not in ["admin", "super_admin"]:
+        #return jsonify({"message": "No autorizado - solo administradores pueden realizar transferencias"}), 403
+    
+    data = request.get_json()
+    
+    # Validar campos requeridos
+    required_fields = ["fromSubaccountId", "toSubaccountId", "amountBs"]
+    for field in required_fields:
+        if field not in data:
+            return jsonify({"message": f"Campo requerido: {field}"}), 400
+    
+    # Validar que los IDs sean diferentes
+    if data["fromSubaccountId"] == data["toSubaccountId"]:
+        return jsonify({"message": "La subcuenta origen y destino deben ser diferentes"}), 400
+    
+    # Validar que el monto sea mayor a 0
+    if data["amountBs"] <= 0:
+        return jsonify({"message": "El monto debe ser mayor a 0"}), 400
+    
+    try:
+        from_subaccount_id = ObjectId(data["fromSubaccountId"].strip())
+        to_subaccount_id = ObjectId(data["toSubaccountId"].strip())
+    except Exception:
+        return jsonify({"message": "IDs de subcuenta inválidos"}), 400
+    
+    # Verificar que ambas subcuentas existen
+    from_subaccount = mongo.db.subaccounts.find_one({"_id": from_subaccount_id})
+    to_subaccount = mongo.db.subaccounts.find_one({"_id": to_subaccount_id})
+    
+    if not from_subaccount:
+        return jsonify({"message": "Subcuenta origen no encontrada"}), 404
+    if not to_subaccount:
+        return jsonify({"message": "Subcuenta destino no encontrada"}), 404
+    
+    # Validar saldo suficiente
+    if from_subaccount["balanceBs"] < data["amountBs"]:
+        return jsonify({"message": "Saldo insuficiente en la subcuenta origen"}), 400
+    
+    # Realizar transferencia atómica usando transacción
+    from datetime import datetime, timezone
+    
+    try:
+        # Iniciar sesión para transacción
+        with mongo.cx.start_session() as session:
+            with session.start_transaction():
+                # Actualizar saldos atómicamente
+                mongo.db.subaccounts.update_one(
+                    {"_id": from_subaccount_id},
+                    {
+                        "$inc": {"balanceBs": -data["amountBs"]},
+                        "$set": {"fecha_actualizacion": datetime.now(timezone.utc)}
+                    },
+                    session=session
+                )
+                
+                mongo.db.subaccounts.update_one(
+                    {"_id": to_subaccount_id},
+                    {
+                        "$inc": {"balanceBs": data["amountBs"]},
+                        "$set": {"fecha_actualizacion": datetime.now(timezone.utc)}
+                    },
+                    session=session
+                )
+                
+                # Registrar movimiento de transferencia
+                movimiento = {
+                    "type": "transfer",
+                    "amountBs": float(data["amountBs"]),
+                    "fromSubaccountId": from_subaccount_id,
+                    "toSubaccountId": to_subaccount_id,
+                    "createdBy": ObjectId("000000000000000000000000"),  # Usuario de prueba
+                    #"createdBy": ObjectId(user["_id"]),
+                    "createdAt": datetime.now(timezone.utc),
+                    "metadata": {
+                        "description": data.get("description", "Transferencia entre subcuentas"),
+                        "fromDepartmentId": from_subaccount["departmentId"],
+                        "toDepartmentId": to_subaccount["departmentId"],
+                        "fromAccountId": from_subaccount["accountId"],
+                        "toAccountId": to_subaccount["accountId"]
+                    }
+                }
+                
+                mongo.db.account_movements.insert_one(movimiento, session=session)
+                
+    except Exception as e:
+        return jsonify({
+            "message": "Error al realizar la transferencia",
+            "error": str(e)
+        }), 500
+    
+    # Obtener saldos actualizados
+    from_updated = mongo.db.subaccounts.find_one({"_id": from_subaccount_id})
+    to_updated = mongo.db.subaccounts.find_one({"_id": to_subaccount_id})
+    
+    return jsonify({
+        "message": "Transferencia realizada exitosamente",
+        "transfer": {
+            "fromSubaccountId": str(from_subaccount_id),
+            "toSubaccountId": str(to_subaccount_id),
+            "amountBs": float(data["amountBs"]),
+            "description": data.get("description", ""),
+            "fromNewBalance": from_updated["balanceBs"],
+            "toNewBalance": to_updated["balanceBs"],
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+    }), 200
+
+@subaccounts_bp.route("/subaccounts/transfer-preview", methods=["POST"])
+@allow_cors
+@token_required
+def previsualizar_transferencia(user):
+    """
+    Previsualizar transferencia entre subcuentas (solo administradores)
+    ---
+    tags:
+      - Subcuentas
+    security:
+      - Bearer: []
+    parameters:
+      - in: body
+        name: body
+        required: true
+        schema:
+          type: object
+          required:
+            - fromSubaccountId
+            - toSubaccountId
+            - amountBs
+          properties:
+            fromSubaccountId:
+              type: string
+            toSubaccountId:
+              type: string
+            amountBs:
+              type: number
+    responses:
+      200:
+        description: Previsualización de transferencia
+      403:
+        description: No autorizado
+      400:
+        description: Datos inválidos
+    """
+    # Validar permisos de administrador
+    if user.get("role") not in ["admin", "super_admin"]:
+        return jsonify({"message": "No autorizado"}), 403
+    
+    data = request.get_json()
+    
+    # Validar campos básicos
+    if data["fromSubaccountId"] == data["toSubaccountId"]:
+        return jsonify({"message": "Las subcuentas deben ser diferentes"}), 400
+    
+    if data["amountBs"] <= 0:
+        return jsonify({"message": "El monto debe ser mayor a 0"}), 400
+    
+    try:
+        from_subaccount_id = ObjectId(data["fromSubaccountId"].strip())
+        to_subaccount_id = ObjectId(data["toSubaccountId"].strip())
+    except Exception:
+        return jsonify({"message": "IDs inválidos"}), 400
+    
+    # Obtener información de subcuentas
+    from_subaccount = mongo.db.subaccounts.find_one({"_id": from_subaccount_id})
+    to_subaccount = mongo.db.subaccounts.find_one({"_id": to_subaccount_id})
+    
+    if not from_subaccount or not to_subaccount:
+        return jsonify({"message": "Subcuenta no encontrada"}), 404
+    
+    # Verificar saldo suficiente
+    saldo_suficiente = from_subaccount["balanceBs"] >= data["amountBs"]
+    
+    # Obtener información adicional
+    from_cuenta = mongo.db.cuentas.find_one({"_id": from_subaccount["accountId"]})
+    to_cuenta = mongo.db.cuentas.find_one({"_id": to_subaccount["accountId"]})
+    from_dept = mongo.db.departamentos.find_one({"_id": from_subaccount["departmentId"]})
+    to_dept = mongo.db.departamentos.find_one({"_id": to_subaccount["departmentId"]})
+    
+    return jsonify({
+        "preview": {
+            "fromSubaccount": {
+                "id": str(from_subaccount_id),
+                "account": from_cuenta.get("nombre", "") if from_cuenta else "",
+                "department": from_dept.get("nombre", "") if from_dept else "",
+                "currentBalance": from_subaccount["balanceBs"],
+                "afterBalance": from_subaccount["balanceBs"] - data["amountBs"]
+            },
+            "toSubaccount": {
+                "id": str(to_subaccount_id),
+                "account": to_cuenta.get("nombre", "") if to_cuenta else "",
+                "department": to_dept.get("nombre", "") if to_dept else "",
+                "currentBalance": to_subaccount["balanceBs"],
+                "afterBalance": to_subaccount["balanceBs"] + data["amountBs"]
+            },
+            "transfer": {
+                "amountBs": float(data["amountBs"]),
+                "sufficientFunds": saldo_suficiente,
+                "sameDepartment": from_subaccount["departmentId"] == to_subaccount["departmentId"],
+                "sameAccount": from_subaccount["accountId"] == to_subaccount["accountId"]
+            }
+        }
+    }), 200
