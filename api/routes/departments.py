@@ -9,9 +9,10 @@ departments_bp = Blueprint('departments', __name__)
 
 @departments_bp.route("/departamentos", methods=["POST"])
 @allow_cors
-@token_required
+#@token_required
 @validar_datos({"nombre": str, "descripcion": str, "codigo": str})
-def crear_departamento(user):
+#def crear_departamento(user):
+def crear_departamento():
     """
     Crear nuevo departamento
     ---
