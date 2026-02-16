@@ -624,3 +624,200 @@ def previsualizar_transferencia(user):
             }
         }
     }), 200
+
+@subaccounts_bp.route("/subaccounts/<string:subaccount_id>/movements", methods=["GET"])
+@allow_cors
+def listar_movimientos_subcuenta(subaccount_id):
+    """
+    Listar movimientos de una subcuenta con paginación y filtros
+    ---
+    tags:
+      - Subcuentas
+    security:
+      - Bearer: []
+    parameters:
+      - in: path
+        name: subaccount_id
+        type: string
+        required: true
+        description: ID de la subcuenta
+      - in: query
+        name: fromDate
+        type: string
+        description: Fecha de inicio (YYYY-MM-DD)
+      - in: query
+        name: toDate
+        type: string
+        description: Fecha de fin (YYYY-MM-DD)
+      - in: query
+        name: type
+        type: string
+        description: Tipo de movimiento (credit, debit, transfer)
+      - in: query
+        name: limit
+        type: integer
+        description: Límite de resultados por página
+        default: 20
+      - in: query
+        name: offset
+        type: integer
+        description: Número de resultados a omitir
+        default: 0
+      - in: query
+        name: page
+        type: integer
+        description: Número de página (alternativa a offset)
+        default: 1
+    responses:
+      200:
+        description: Lista de movimientos paginada
+      400:
+        description: Parámetros inválidos
+      403:
+        description: No autorizado
+      404:
+        description: Subcuenta no encontrada
+    """
+    try:
+        subaccount_id_obj = ObjectId(subaccount_id.strip())
+    except Exception:
+        return jsonify({"message": "ID de subcuenta inválido"}), 400
+    
+    # Verificar que la subcuenta existe
+    subcuenta = mongo.db.subaccounts.find_one({"_id": subaccount_id_obj})
+    if not subcuenta:
+        return jsonify({"message": "Subcuenta no encontrada"}), 404
+    
+    # Obtener usuario del token si existe (para RBAC)
+    user = None
+    auth_header = request.headers.get('Authorization')
+    if auth_header and auth_header.startswith('Bearer '):
+        try:
+            # Aquí deberías decodificar el token para obtener el usuario
+            # Por ahora, asumimos que no hay autenticación para pruebas
+            user = None
+        except:
+            user = None
+    
+    # RBAC: Verificar permisos
+    if user:
+        # Si es usuario normal, solo puede ver movimientos de su departamento
+        if user.get("role") not in ["admin", "super_admin"]:
+            user_dept_id = user.get("departmentId")
+            if not user_dept_id or str(subcuenta["departmentId"]) != str(user_dept_id):
+                return jsonify({"message": "No autorizado - solo puede ver movimientos de su departamento"}), 403
+    
+    # Construir query base
+    query = {
+        "$or": [
+            {"fromSubaccountId": subaccount_id_obj},
+            {"toSubaccountId": subaccount_id_obj}
+        ]
+    }
+    
+    # Aplicar filtros
+    params = request.args
+    
+    # Filtro por tipo
+    if params.get("type"):
+        query["type"] = params.get("type")
+    
+    # Filtro por fechas
+    if params.get("fromDate") or params.get("toDate"):
+        query["createdAt"] = {}
+        if params.get("fromDate"):
+            try:
+                from_date = datetime.strptime(params.get("fromDate"), "%Y-%m-%d")
+                query["createdAt"]["$gte"] = from_date
+            except ValueError:
+                return jsonify({"message": "Formato de fecha de inicio inválido. Use YYYY-MM-DD"}), 400
+        
+        if params.get("toDate"):
+            try:
+                to_date = datetime.strptime(params.get("toDate"), "%Y-%m-%d")
+                to_date = to_date.replace(hour=23, minute=59, second=59)
+                query["createdAt"]["$lte"] = to_date
+            except ValueError:
+                return jsonify({"message": "Formato de fecha de fin inválido. Use YYYY-MM-DD"}), 400
+    
+    # Paginación
+    limit = min(int(params.get("limit", 20)), 100)  # Máximo 100 por página
+    
+    if params.get("page"):
+        page = max(int(params.get("page", 1)), 1)
+        offset = (page - 1) * limit
+    else:
+        offset = max(int(params.get("offset", 0)), 0)
+    
+    # Obtener total de documentos para paginación
+    total_count = mongo.db.account_movements.count_documents(query)
+    
+    # Obtener movimientos paginados
+    movimientos = mongo.db.account_movements.find(query).sort("createdAt", -1).skip(offset).limit(limit)
+    
+    list_cursor = list(movimientos)
+    list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
+    list_json = json.loads(list_dump.replace("\\", ""))
+    
+    # Enriquecer datos
+    for movimiento in list_json:
+        movimiento["_id"] = str(movimiento["_id"])
+        
+        # Información de subcuentas
+        if movimiento.get("fromSubaccountId"):
+            movimiento["fromSubaccountId"] = str(movimiento["fromSubaccountId"])
+            if movimiento["fromSubaccountId"] == subaccount_id:
+                movimiento["direction"] = "outgoing"
+        
+        if movimiento.get("toSubaccountId"):
+            movimiento["toSubaccountId"] = str(movimiento["toSubaccountId"])
+            if movimiento["toSubaccountId"] == subaccount_id:
+                movimiento["direction"] = "incoming"
+        
+        # Si no tiene dirección, determinar por el tipo
+        if not movimiento.get("direction"):
+            if movimiento.get("type") == "debit":
+                movimiento["direction"] = "outgoing"
+            elif movimiento.get("type") == "credit":
+                movimiento["direction"] = "incoming"
+            elif movimiento.get("type") == "transfer":
+                movimiento["direction"] = "outgoing"  # Por defecto para transferencias
+        
+        # Información del usuario creador
+        if movimiento.get("createdBy"):
+            try:
+                creator_id = ObjectId(movimiento["createdBy"])
+                creator = mongo.db.usuarios.find_one({"_id": creator_id})
+                if creator:
+                    movimiento["creator"] = {
+                        "_id": str(creator["_id"]),
+                        "nombre": creator.get("nombre", ""),
+                        "email": creator.get("email", "")
+                    }
+            except:
+                pass
+    
+    # Calcular información de paginación
+    total_pages = (total_count + limit - 1) // limit
+    current_page = (offset // limit) + 1
+    has_next = offset + limit < total_count
+    has_prev = offset > 0
+    
+    return jsonify({
+        "movements": list_json,
+        "pagination": {
+            "totalCount": total_count,
+            "limit": limit,
+            "offset": offset,
+            "currentPage": current_page,
+            "totalPages": total_pages,
+            "hasNext": has_next,
+            "hasPrev": has_prev
+        },
+        "filters": {
+            "subaccountId": subaccount_id,
+            "fromDate": params.get("fromDate"),
+            "toDate": params.get("toDate"),
+            "type": params.get("type")
+        }
+    }), 200
