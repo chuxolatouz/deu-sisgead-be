@@ -3,7 +3,7 @@ from bson import json_util, ObjectId
 import json
 from datetime import datetime
 from api.extensions import mongo
-from api.util.decorators import allow_cors, validar_datos, token_required
+from api.util.decorators import allow_cors, validar_datos, token_required, admin_required, apply_department_filter
 
 accounts_bp = Blueprint('accounts', __name__)
 
@@ -20,6 +20,12 @@ def serialize_account(account):
         "description": account.get("description", ""),
         "active": account.get("active", True)
     }
+    
+    # Serializar departamentos (array de ObjectIds a array de strings)
+    if "departments" in account and account["departments"]:
+        serialized["departments"] = [str(dept_id) for dept_id in account["departments"]]
+    else:
+        serialized["departments"] = []
     
     # Convertir fechas a strings ISO
     if "created_at" in account and account["created_at"]:
@@ -39,12 +45,15 @@ def serialize_account(account):
 
 @accounts_bp.route("/accounts", methods=["GET"])
 @allow_cors
-def obtener_cuentas():
+@token_required
+def obtener_cuentas(data_token):
     """
-    Listar cuentas contables con filtros opcionales
+    Listar cuentas contables con filtros opcionales y control de acceso por departamento
     ---
     tags:
       - Cuentas Contables
+    security:
+      - Bearer: []
     parameters:
       - in: query
         name: code
@@ -73,7 +82,7 @@ def obtener_cuentas():
         example: 50
     responses:
       200:
-        description: Lista de cuentas contables
+        description: Lista de cuentas contables (filtradas por departamento si no es admin)
         schema:
           type: object
           properties:
@@ -95,6 +104,11 @@ def obtener_cuentas():
                   description:
                     type: string
                     example: "Cuenta para manejo de efectivo en caja"
+                  departments:
+                    type: array
+                    items:
+                      type: string
+                    description: IDs de departamentos asociados
                   active:
                     type: boolean
                     example: true
@@ -115,12 +129,20 @@ def obtener_cuentas():
                   type: integer
                 pages:
                   type: integer
+      403:
+        description: No autorizado
       500:
         description: Error interno del servidor
     """
     try:
         # Construir filtro de búsqueda
         filtro = {}
+        
+        # Aplicar filtro de departamento basado en rol del usuario
+        # Super admin ve todo, usuarios normales solo ven cuentas de su departamento
+        dept_filter = apply_department_filter(data_token)
+        if dept_filter:
+            filtro.update(dept_filter)
         
         # Filtro por código (búsqueda parcial)
         code_param = request.args.get("code")
@@ -172,12 +194,15 @@ def obtener_cuentas():
 
 @accounts_bp.route("/accounts/<account_id>", methods=["GET"])
 @allow_cors
-def obtener_cuenta_por_id(account_id):
+@token_required
+def obtener_cuenta_por_id(data_token, account_id):
     """
-    Obtener una cuenta contable específica por ID
+    Obtener una cuenta contable específica por ID (con control de acceso por departamento)
     ---
     tags:
       - Cuentas Contables
+    security:
+      - Bearer: []
     parameters:
       - in: path
         name: account_id
@@ -199,6 +224,10 @@ def obtener_cuenta_por_id(account_id):
               type: string
             description:
               type: string
+            departments:
+              type: array
+              items:
+                type: string
             active:
               type: boolean
             created_at:
@@ -207,6 +236,8 @@ def obtener_cuenta_por_id(account_id):
             updated_at:
               type: string
               format: date-time
+      403:
+        description: Acceso denegado
       404:
         description: Cuenta no encontrada
       500:
@@ -216,9 +247,21 @@ def obtener_cuenta_por_id(account_id):
         if not ObjectId.is_valid(account_id):
             return jsonify({"message": "ID de cuenta inválido"}), 400
         
-        cuenta = mongo.db.accounts.find_one({"_id": ObjectId(account_id)})
+        # Construir filtro con ID y restricción de departamento
+        filtro = {"_id": ObjectId(account_id)}
+        
+        # Aplicar filtro de departamento si no es super_admin
+        dept_filter = apply_department_filter(data_token)
+        if dept_filter:
+            filtro.update(dept_filter)
+        
+        cuenta = mongo.db.accounts.find_one(filtro)
         
         if not cuenta:
+            # Verificar si la cuenta existe pero el usuario no tiene acceso
+            cuenta_existe = mongo.db.accounts.find_one({"_id": ObjectId(account_id)})
+            if cuenta_existe:
+                return jsonify({"message": "Acceso denegado. No tiene permisos para ver esta cuenta"}), 403
             return jsonify({"message": "Cuenta no encontrada"}), 404
         
         cuenta_serializada = serialize_account(cuenta)
@@ -232,6 +275,7 @@ def obtener_cuenta_por_id(account_id):
 @accounts_bp.route("/accounts", methods=["POST"])
 @allow_cors
 @token_required
+@admin_required
 @validar_datos({"code": str, "name": str})
 def crear_cuenta(data_token):
     """
@@ -263,6 +307,12 @@ def crear_cuenta(data_token):
               type: string
               description: Descripción detallada de la cuenta
               example: "Cuenta para manejo de efectivo en caja"
+            departments:
+              type: array
+              items:
+                type: string
+              description: Array de IDs de departamentos asociados
+              example: ["507f1f77bcf86cd799439011"]
             active:
               type: boolean
               description: Estado de la cuenta (default true)
@@ -305,11 +355,35 @@ def crear_cuenta(data_token):
         if cuenta_existente:
             return jsonify({"message": f"Ya existe una cuenta con el código '{code}'"}), 400
         
+        # Procesar departamentos
+        departments = []
+        if "departments" in data and data["departments"]:
+            # Validar que los departamentos existan
+            for dept_id_str in data["departments"]:
+                try:
+                    dept_id = ObjectId(dept_id_str)
+                    departamento = mongo.db.departamentos.find_one({"_id": dept_id})
+                    if not departamento:
+                        return jsonify({"message": f"Departamento con ID '{dept_id_str}' no encontrado"}), 400
+                    departments.append(dept_id)
+                except Exception:
+                    return jsonify({"message": f"ID de departamento inválido: '{dept_id_str}'"}), 400
+        else:
+            # Si no se especifican departamentos y el usuario no es super_admin,
+            # asignar automáticamente al departamento del usuario
+            if data_token.get("role") != "super_admin":
+                if "departamento_id" in data_token and data_token["departamento_id"]:
+                    try:
+                        departments.append(ObjectId(data_token["departamento_id"]))
+                    except Exception:
+                        pass
+        
         # Crear la cuenta
         cuenta = {
             "code": code,
             "name": name,
             "description": description,
+            "departments": departments,
             "active": active,
             "created_at": datetime.utcnow(),
             "updated_at": datetime.utcnow(),
@@ -337,9 +411,10 @@ def crear_cuenta(data_token):
 @accounts_bp.route("/accounts/<account_id>", methods=["PUT"])
 @allow_cors
 @token_required
+@admin_required
 def actualizar_cuenta(data_token, account_id):
     """
-    Actualizar una cuenta contable existente
+    Actualizar una cuenta contable existente (con control de acceso por departamento)
     ---
     tags:
       - Cuentas Contables
@@ -368,6 +443,11 @@ def actualizar_cuenta(data_token, account_id):
             description:
               type: string
               description: Descripción de la cuenta
+            departments:
+              type: array
+              items:
+                type: string
+              description: Array de IDs de departamentos asociados
             active:
               type: boolean
               description: Estado de la cuenta
@@ -378,7 +458,7 @@ def actualizar_cuenta(data_token, account_id):
       400:
         description: Datos inválidos
       403:
-        description: No autorizado
+        description: No autorizado o acceso denegado
       404:
         description: Cuenta no encontrada
       500:
@@ -393,9 +473,18 @@ def actualizar_cuenta(data_token, account_id):
         if not data:
             return jsonify({"message": "No se proporcionaron datos para actualizar"}), 400
         
-        # Verificar que la cuenta existe
-        cuenta_existente = mongo.db.accounts.find_one({"_id": ObjectId(account_id)})
+        # Verificar que la cuenta existe y el usuario tiene acceso
+        filtro_acceso = {"_id": ObjectId(account_id)}
+        dept_filter = apply_department_filter(data_token)
+        if dept_filter:
+            filtro_acceso.update(dept_filter)
+        
+        cuenta_existente = mongo.db.accounts.find_one(filtro_acceso)
         if not cuenta_existente:
+            # Verificar si la cuenta existe pero el usuario no tiene acceso
+            cuenta_existe = mongo.db.accounts.find_one({"_id": ObjectId(account_id)})
+            if cuenta_existe:
+                return jsonify({"message": "Acceso denegado. No tiene permisos para modificar esta cuenta"}), 403
             return jsonify({"message": "Cuenta no encontrada"}), 404
         
         # Construir objeto de actualización
@@ -425,6 +514,23 @@ def actualizar_cuenta(data_token, account_id):
         if "active" in data:
             actualizacion["active"] = data["active"]
         
+        # Procesar departamentos (solo si se proporciona)
+        if "departments" in data:
+            departments = []
+            if data["departments"]:
+                # Validar que los departamentos existan
+                for dept_id_str in data["departments"]:
+                    try:
+                        dept_id = ObjectId(dept_id_str)
+                        departamento = mongo.db.departamentos.find_one({"_id": dept_id})
+                        if not departamento:
+                            return jsonify({"message": f"Departamento con ID '{dept_id_str}' no encontrado"}), 400
+                        departments.append(dept_id)
+                    except Exception:
+                        return jsonify({"message": f"ID de departamento inválido: '{dept_id_str}'"}), 400
+            
+            actualizacion["departments"] = departments
+        
         # Actualizar la cuenta
         resultado = mongo.db.accounts.update_one(
             {"_id": ObjectId(account_id)},
@@ -450,6 +556,7 @@ def actualizar_cuenta(data_token, account_id):
 @accounts_bp.route("/accounts/<account_id>", methods=["DELETE"])
 @allow_cors
 @token_required
+@admin_required
 def desactivar_cuenta(data_token, account_id):
     """
     Desactivar una cuenta contable (soft delete)

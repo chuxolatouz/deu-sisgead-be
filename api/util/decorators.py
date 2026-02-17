@@ -2,6 +2,7 @@ from flask import make_response, request, jsonify, current_app
 from jose import jwt
 from functools import wraps
 from api.util.utils import obtener_contexto_departamento_desde_header
+from bson import ObjectId
 
 
 def allow_cors(f):
@@ -58,3 +59,51 @@ def token_required(f):
         return f(data, *args, **kwargs)
 
     return decorated
+
+
+def admin_required(f):
+    """
+    Decorador para verificar que el usuario tenga rol de super_admin.
+    Debe usarse después de token_required.
+    """
+    @wraps(f)
+    def decorated(data_token, *args, **kwargs):
+        if data_token.get("role") != "super_admin":
+            return jsonify({"message": "Acceso denegado. Se requiere rol de administrador"}), 403
+        return f(data_token, *args, **kwargs)
+    return decorated
+
+
+def apply_department_filter(user_data):
+    """
+    Función helper para aplicar filtro de departamento basado en el rol del usuario.
+    
+    Args:
+        user_data: Datos del usuario decodificados del token JWT
+        
+    Returns:
+        dict: Filtro MongoDB para departamentos o None si es super_admin
+    """
+    # Super admin ve todo (sin filtro)
+    if user_data.get("role") == "super_admin":
+        return None
+    
+    # Admin de departamento y usuarios normales ven solo su(s) departamento(s)
+    # Obtener departamentos del usuario
+    user_departments = []
+    
+    # Si el usuario tiene departamento_id en el token
+    if "departamento_id" in user_data and user_data["departamento_id"]:
+        try:
+            dept_id = ObjectId(user_data["departamento_id"])
+            user_departments.append(dept_id)
+        except Exception:
+            pass
+    
+    # Si no tiene departamentos asignados, no puede ver nada
+    if not user_departments:
+        # Retornar un filtro que no coincida con nada
+        return {"departments": {"$in": [ObjectId("000000000000000000000000")]}}
+    
+    # Filtrar por cuentas que tengan al menos uno de los departamentos del usuario
+    return {"departments": {"$in": user_departments}}
