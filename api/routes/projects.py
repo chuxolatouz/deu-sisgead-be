@@ -92,11 +92,6 @@ def crear_proyecto(user):
     current_user = user["sub"]
     data = request.get_json()
     
-    # #region agent log
-    log_data = {"location": "projects.py:25", "message": "Backend received proyecto data", "data": {"data_keys": list(data.keys()) if data else [], "categoria_in_data": "categoria" in data if data else False, "categoria_value": data.get("categoria") if data else None, "categoria_type": type(data.get("categoria")).__name__ if data and "categoria" in data else None}, "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000), "sessionId": "debug-session", "runId": "post-fix", "hypothesisId": "A"}
-    with open("/Users/MacBook/Develop/deu-sisgead/.cursor/debug.log", "a") as f:
-        f.write(json.dumps(log_data) + "\n")
-    # #endregion
     
     departamento_id = None
     if "departamento_id" in data and data["departamento_id"]:
@@ -150,20 +145,8 @@ def crear_proyecto(user):
         else:
             return jsonify({"message": "Categoría no encontrada"}), 400
     
-    # #region agent log
-    log_data = {"location": "projects.py:95", "message": "Data before insert", "data": {"data_keys": list(data.keys()), "categoria_in_data": "categoria" in data, "categoria_value": str(data.get("categoria")) if "categoria" in data else None, "categoria_type": type(data.get("categoria")).__name__ if "categoria" in data else None}, "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000), "sessionId": "debug-session", "runId": "post-fix", "hypothesisId": "B"}
-    with open("/Users/MacBook/Develop/deu-sisgead/.cursor/debug.log", "a") as f:
-        f.write(json.dumps(log_data) + "\n")
-    # #endregion
-    
     project = mongo.db.proyectos.insert_one(data)
-    
-    # #region agent log
-    inserted_doc = mongo.db.proyectos.find_one({"_id": project.inserted_id})
-    log_data = {"location": "projects.py:110", "message": "Data after insert", "data": {"inserted_keys": list(inserted_doc.keys()) if inserted_doc else [], "categoria_in_inserted": "categoria" in inserted_doc if inserted_doc else False, "categoria_value": str(inserted_doc.get("categoria")) if inserted_doc and "categoria" in inserted_doc else None, "categoria_type": type(inserted_doc.get("categoria")).__name__ if inserted_doc and "categoria" in inserted_doc else None}, "timestamp": int(datetime.now(timezone.utc).timestamp() * 1000), "sessionId": "debug-session", "runId": "post-fix", "hypothesisId": "C"}
-    with open("/Users/MacBook/Develop/deu-sisgead/.cursor/debug.log", "a") as f:
-        f.write(json.dumps(log_data) + "\n")
-    # #endregion
+
     message_log = "Usuario %s ha creado el proyecto" % user["nombre"]
     agregar_log(project.inserted_id, message_log)
     return jsonify({"message": "Proyecto creado con éxito", "_id": str(project.inserted_id)}), 201
@@ -874,5 +857,4 @@ def mostrar_finalizacion(id):
     logs_json = json.loads(json_util.dumps(list(logs)).replace("\\", ""))
 
     return jsonify(logs=logs_json, documentos=docs_json, movimientos=movs_json), 200
-
 
