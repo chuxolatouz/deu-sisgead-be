@@ -351,8 +351,12 @@ class AccountScopeService:
     def transfer_between_accounts(
         *,
         year: int,
-        scope_type: str,
-        scope_id: str,
+        scope_type: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        from_scope_type: Optional[str] = None,
+        from_scope_id: Optional[str] = None,
+        to_scope_type: Optional[str] = None,
+        to_scope_id: Optional[str] = None,
         from_account_code: str,
         to_account_code: str,
         amount: float,
@@ -362,9 +366,28 @@ class AccountScopeService:
         allow_negative: bool,
     ) -> Dict[str, Any]:
         AccountingIndexes.ensure_indexes()
+        valid_scopes = {"department", "project", "global"}
         if amount <= 0:
             raise ValueError("amount debe ser mayor que 0")
-        if from_account_code == to_account_code:
+
+        resolved_from_scope_type = (from_scope_type or scope_type or "").strip()
+        resolved_to_scope_type = (to_scope_type or scope_type or resolved_from_scope_type or "").strip()
+        resolved_from_scope_id = str(from_scope_id or scope_id or "").strip()
+        resolved_to_scope_id = str(to_scope_id or scope_id or "").strip()
+
+        if resolved_from_scope_type not in valid_scopes or resolved_to_scope_type not in valid_scopes:
+            raise ValueError("scopeType debe ser department, project o global")
+        if resolved_from_scope_type == "global" and not resolved_from_scope_id:
+            resolved_from_scope_id = "global"
+        if resolved_to_scope_type == "global" and not resolved_to_scope_id:
+            resolved_to_scope_id = "global"
+        if not resolved_from_scope_id or not resolved_to_scope_id:
+            raise ValueError("scopeId es requerido para ambos extremos de la transferencia")
+        if (
+            from_account_code == to_account_code
+            and resolved_from_scope_type == resolved_to_scope_type
+            and resolved_from_scope_id == resolved_to_scope_id
+        ):
             raise ValueError("La cuenta origen y destino deben ser distintas")
 
         source = mongo.db.master_accounts.find_one({"year": int(year), "code": from_account_code})
@@ -374,8 +397,18 @@ class AccountScopeService:
         if source.get("is_header") or target.get("is_header"):
             raise ValueError("Las transferencias requieren cuentas detalle, no cuentas titular")
 
-        source_filter = {"year": int(year), "scopeType": scope_type, "scopeId": scope_id, "accountCode": from_account_code}
-        target_filter = {"year": int(year), "scopeType": scope_type, "scopeId": scope_id, "accountCode": to_account_code}
+        source_filter = {
+            "year": int(year),
+            "scopeType": resolved_from_scope_type,
+            "scopeId": resolved_from_scope_id,
+            "accountCode": from_account_code,
+        }
+        target_filter = {
+            "year": int(year),
+            "scopeType": resolved_to_scope_type,
+            "scopeId": resolved_to_scope_id,
+            "accountCode": to_account_code,
+        }
 
         source_state = mongo.db.account_scope_state.find_one(source_filter, {"balance": 1}) or {"balance": 0}
         source_balance = float(source_state.get("balance", 0))
@@ -387,13 +420,17 @@ class AccountScopeService:
         transfer_ref = {
             "kind": "transfer",
             "id": transfer_id,
+            "fromScopeType": resolved_from_scope_type,
+            "fromScopeId": resolved_from_scope_id,
+            "toScopeType": resolved_to_scope_type,
+            "toScopeId": resolved_to_scope_id,
             **(reference or {}),
         }
 
         source_movement = {
             "year": int(year),
-            "scopeType": scope_type,
-            "scopeId": scope_id,
+            "scopeType": resolved_from_scope_type,
+            "scopeId": resolved_from_scope_id,
             "accountCode": from_account_code,
             "type": "credit",
             "amount": float(amount),
@@ -406,8 +443,8 @@ class AccountScopeService:
 
         target_movement = {
             "year": int(year),
-            "scopeType": scope_type,
-            "scopeId": scope_id,
+            "scopeType": resolved_to_scope_type,
+            "scopeId": resolved_to_scope_id,
             "accountCode": to_account_code,
             "type": "debit",
             "amount": float(amount),
@@ -470,8 +507,10 @@ class AccountScopeService:
         target_new = mongo.db.account_scope_state.find_one(target_filter, {"_id": 0}) or {}
         return {
             "transferId": transfer_id,
-            "scopeType": scope_type,
-            "scopeId": scope_id,
+            "fromScopeType": resolved_from_scope_type,
+            "fromScopeId": resolved_from_scope_id,
+            "toScopeType": resolved_to_scope_type,
+            "toScopeId": resolved_to_scope_id,
             "fromAccountCode": from_account_code,
             "toAccountCode": to_account_code,
             "amount": float(amount),

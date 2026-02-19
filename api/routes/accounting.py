@@ -491,18 +491,27 @@ def admin_transfer_between_accounts(user):
 
     data = request.get_json(silent=True) or {}
     year = int(data.get("year", _parse_year()))
-    scope_type = str(data.get("scopeType", "")).strip()
-    scope_id = str(data.get("scopeId", "")).strip()
+    legacy_scope_type = str(data.get("scopeType", "")).strip()
+    legacy_scope_id = str(data.get("scopeId", "")).strip()
+    from_scope_type = str(data.get("fromScopeType", legacy_scope_type)).strip()
+    to_scope_type = str(data.get("toScopeType", legacy_scope_type)).strip()
+    from_scope_id = str(data.get("fromScopeId", legacy_scope_id)).strip()
+    to_scope_id = str(data.get("toScopeId", legacy_scope_id)).strip()
     from_account_code = str(data.get("fromAccountCode", "")).strip()
     to_account_code = str(data.get("toAccountCode", "")).strip()
     from_account_description = str(data.get("fromAccountDescription", "")).strip()
     to_account_description = str(data.get("toAccountDescription", "")).strip()
     amount = data.get("amount")
 
-    if scope_type not in {"department", "project"}:
-        return jsonify({"message": "scopeType es requerido y debe ser department o project"}), 400
-    if not scope_id:
-        return jsonify({"message": "scopeId es requerido"}), 400
+    valid_scopes = {"department", "project", "global"}
+    if from_scope_type not in valid_scopes or to_scope_type not in valid_scopes:
+        return jsonify({"message": "fromScopeType y toScopeType deben ser department, project o global"}), 400
+    if from_scope_type == "global" and not from_scope_id:
+        from_scope_id = "global"
+    if to_scope_type == "global" and not to_scope_id:
+        to_scope_id = "global"
+    if not from_scope_id or not to_scope_id:
+        return jsonify({"message": "fromScopeId y toScopeId son requeridos"}), 400
     if not from_account_code or not to_account_code:
         return jsonify({"message": "fromAccountCode y toAccountCode son requeridos"}), 400
     if amount is None:
@@ -518,8 +527,12 @@ def admin_transfer_between_accounts(user):
 
         result = AccountScopeService.transfer_between_accounts(
             year=year,
-            scope_type=scope_type,
-            scope_id=scope_id,
+            scope_type=legacy_scope_type or from_scope_type,
+            scope_id=legacy_scope_id or from_scope_id,
+            from_scope_type=from_scope_type,
+            from_scope_id=from_scope_id,
+            to_scope_type=to_scope_type,
+            to_scope_id=to_scope_id,
             from_account_code=from_account_code,
             to_account_code=to_account_code,
             amount=amount_value,

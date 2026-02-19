@@ -92,8 +92,10 @@ Fallback durante seed:
 ```json
 {
   "year": 2025,
-  "scopeType": "department",
-  "scopeId": "67ab1234...",
+  "fromScopeType": "global",
+  "fromScopeId": "global",
+  "toScopeType": "department",
+  "toScopeId": "67ab1234...",
   "fromAccountCode": "401010100000",
   "toAccountCode": "401010200000",
   "fromAccountDescription": "Servicios básicos",
