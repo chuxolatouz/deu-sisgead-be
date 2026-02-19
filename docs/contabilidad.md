@@ -68,6 +68,7 @@ Fallback durante seed:
 - `POST /api/admin/sync/departments-from-units?year=2025`
 - `GET /api/admin/contabilidad/consolidado?year=2025[&scopeType=department|project&scopeId=...]`
 - `POST /api/admin/accounts/transfer`
+- `POST /api/admin/accounts/movements` (scope `department|project|global`)
 
 ## Ejemplos de payload
 
@@ -95,6 +96,8 @@ Fallback durante seed:
   "scopeId": "67ab1234...",
   "fromAccountCode": "401010100000",
   "toAccountCode": "401010200000",
+  "fromAccountDescription": "Servicios básicos",
+  "toAccountDescription": "Materiales y suministros",
   "amount": 250,
   "description": "Transferencia interna"
 }

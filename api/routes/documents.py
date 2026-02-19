@@ -232,7 +232,8 @@ def cerrar_presupuesto(user):
     carpeta_proyecto = os.path.join("files", id)
     referencia = request.form.get("referencia")
     monto_transferencia = request.form.get("monto_transferencia")
-    cuenta_contable = request.form.get("cuenta_contable")
+    banco = (request.form.get("banco") or "").strip()
+    cuenta_contable = (request.form.get("cuenta_contable") or "").strip()
 
     if not os.path.exists(carpeta_proyecto):
         os.makedirs(carpeta_proyecto)
@@ -255,7 +256,7 @@ def cerrar_presupuesto(user):
         "total_amount": balance,
         "referencia": referencia,
         "monto_transferencia": monto_transferencia,
-        "banco": request.form.get("banco"),
+        "banco": banco,
         "cuenta_contable": cuenta_contable,
         "created_at": datetime.utcnow()
     }
@@ -289,7 +290,7 @@ def cerrar_presupuesto(user):
                 "description": data_descripcion,
                 "referencia": referencia,
                 "monto_transferencia": monto_transferencia,
-                "banco": "banco", # TODO: check if this was intended to be hardcoded or variable
+                "banco": banco,
                 "cuenta_contable": cuenta_contable
             }
         },

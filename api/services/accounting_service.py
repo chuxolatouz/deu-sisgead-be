@@ -279,7 +279,8 @@ class AccountScopeService:
         if not account:
             raise ValueError("La cuenta contable no existe para el año indicado")
 
-        if account.get("is_header"):
+        # En alcance global se permite cargar saldo en cuentas titular para consolidado base.
+        if account.get("is_header") and scope_type != "global":
             raise ValueError("No se permiten movimientos sobre cuentas titular. Use cuentas detalle")
 
         delta = float(amount) if movement_type == "debit" else -float(amount)

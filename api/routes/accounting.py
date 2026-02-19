@@ -345,7 +345,7 @@ def admin_list_accounts(user):
 
     account_codes = [row["code"] for row in rows]
     state_match = {"year": year, "accountCode": {"$in": account_codes}}
-    if scope_type in {"department", "project"}:
+    if scope_type in {"department", "project", "global"}:
         state_match["scopeType"] = scope_type
         if scope_id:
             state_match["scopeId"] = scope_id
@@ -495,6 +495,8 @@ def admin_transfer_between_accounts(user):
     scope_id = str(data.get("scopeId", "")).strip()
     from_account_code = str(data.get("fromAccountCode", "")).strip()
     to_account_code = str(data.get("toAccountCode", "")).strip()
+    from_account_description = str(data.get("fromAccountDescription", "")).strip()
+    to_account_description = str(data.get("toAccountDescription", "")).strip()
     amount = data.get("amount")
 
     if scope_type not in {"department", "project"}:
@@ -508,12 +510,69 @@ def admin_transfer_between_accounts(user):
 
     try:
         amount_value = float(amount)
+        reference_payload = data.get("reference") if isinstance(data.get("reference"), dict) else {}
+        if from_account_description:
+            reference_payload["fromAccountDescription"] = from_account_description
+        if to_account_description:
+            reference_payload["toAccountDescription"] = to_account_description
+
         result = AccountScopeService.transfer_between_accounts(
             year=year,
             scope_type=scope_type,
             scope_id=scope_id,
             from_account_code=from_account_code,
             to_account_code=to_account_code,
+            amount=amount_value,
+            description=str(data.get("description", "")).strip(),
+            reference=reference_payload,
+            created_by=str(user.get("sub")),
+            allow_negative=_allow_negative_balances(),
+        )
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
+
+    if from_account_description:
+        result["fromAccountDescription"] = from_account_description
+    if to_account_description:
+        result["toAccountDescription"] = to_account_description
+
+    return jsonify(result), 201
+
+
+@accounting_bp.route("/admin/accounts/movements", methods=["POST"])
+@accounting_bp.route("/api/admin/accounts/movements", methods=["POST"])
+@allow_cors
+@token_required
+def admin_create_movement(user):
+    if not _is_super_admin(user):
+        return _forbidden("Solo super_admin puede registrar movimientos globales")
+
+    data = request.get_json(silent=True) or {}
+    year = int(data.get("year", _parse_year()))
+    scope_type = str(data.get("scopeType", "")).strip()
+    scope_id = str(data.get("scopeId", "")).strip()
+    account_code = str(data.get("accountCode", "")).strip()
+    movement_type = str(data.get("type", "")).strip().lower()
+    amount = data.get("amount")
+
+    if scope_type not in {"department", "project", "global"}:
+        return jsonify({"message": "scopeType debe ser department, project o global"}), 400
+    if not scope_id:
+        if scope_type == "global":
+            scope_id = "global"
+        else:
+            return jsonify({"message": "scopeId es requerido"}), 400
+    if not account_code or amount is None or movement_type not in {"debit", "credit"}:
+        return jsonify({"message": "Campos requeridos: accountCode, type, amount"}), 400
+
+    try:
+        amount_value = float(amount)
+        result = AccountScopeService.create_movement(
+            year=year,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            account_code=account_code,
+            movement_type=movement_type,
             amount=amount_value,
             description=str(data.get("description", "")).strip(),
             reference=data.get("reference") if isinstance(data.get("reference"), dict) else {},
