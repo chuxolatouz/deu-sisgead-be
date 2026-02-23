@@ -63,6 +63,10 @@ Fallback durante seed:
 - `POST /projects/:id/accounts/init?year=2025&mode=detail_only|all|group:EGRESO`
 - `POST /projects/:id/movements`
 
+Filtros opcionales en `GET /projects/:id/accounts` y `GET /departments/:id/accounts`:
+- `assignedOnly=true|false` (default `false`): solo cuentas existentes en `account_scope_state` del scope.
+- `includeZero=true|false` (default `true`): incluye/excluye cuentas asignadas con `balance=0` y `movementsCount=0`.
+
 ### Admin
 - `POST /api/admin/seed/contabilidad/2025`
 - `POST /api/admin/sync/departments-from-units?year=2025`
@@ -142,6 +146,7 @@ Ejemplos:
 - Inicializacion eager disponible via `/accounts/init`.
 - Validacion configurable de negativos por env var:
   - `ACCOUNTING_ALLOW_NEGATIVE=true|false` (default `true`).
+- En vistas con filtros (`assignedOnly/includeZero`) se preservan ancestros para no romper la jerarquia del arbol.
 
 ## RBAC aplicado
 

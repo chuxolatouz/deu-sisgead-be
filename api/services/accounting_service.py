@@ -177,7 +177,14 @@ class AccountCatalogService:
 
 class AccountScopeService:
     @staticmethod
-    def get_scope_accounts(year: int, scope_type: str, scope_id: str, group: Optional[str] = None) -> Dict[str, Any]:
+    def get_scope_accounts(
+        year: int,
+        scope_type: str,
+        scope_id: str,
+        group: Optional[str] = None,
+        assigned_only: bool = False,
+        include_zero: bool = True,
+    ) -> Dict[str, Any]:
         AccountingIndexes.ensure_indexes()
         accounts_query: Dict[str, Any] = {"year": int(year)}
         if group:
@@ -189,20 +196,69 @@ class AccountScopeService:
             {"_id": 0, "accountCode": 1, "balance": 1, "movementsCount": 1, "lastMovementAt": 1},
         )
         state_by_code = {row["accountCode"]: row for row in states_cursor}
+        all_assigned_codes = set(state_by_code.keys())
+
+        by_code: Dict[str, Dict[str, Any]] = {}
 
         merged = []
         for account in accounts:
             state = state_by_code.get(account["code"], {})
+            has_state = account["code"] in all_assigned_codes
+            item = {
+                **account,
+                "balance": state.get("balance", 0),
+                "movementsCount": state.get("movementsCount", 0),
+                "lastMovementAt": state.get("lastMovementAt"),
+                "hasState": has_state,
+            }
+            by_code[item["code"]] = item
             merged.append(
-                {
-                    **account,
-                    "balance": state.get("balance", 0),
-                    "movementsCount": state.get("movementsCount", 0),
-                    "lastMovementAt": state.get("lastMovementAt"),
-                }
+                item
             )
 
-        return {"year": int(year), "scopeType": scope_type, "scopeId": scope_id, "tree": _build_tree(merged)}
+        if assigned_only:
+            visible_codes = set(all_assigned_codes)
+        else:
+            visible_codes = set(by_code.keys())
+
+        if not include_zero:
+            non_zero_codes = {
+                code
+                for code in visible_codes
+                if float(by_code.get(code, {}).get("balance", 0) or 0) != 0
+                or float(by_code.get(code, {}).get("movementsCount", 0) or 0) > 0
+            }
+
+            # Preserve parent chain so the tree remains navigable.
+            with_ancestors = set(non_zero_codes)
+            for code in list(non_zero_codes):
+                current = by_code.get(code)
+                while current and current.get("parent_code"):
+                    parent_code = current["parent_code"]
+                    parent = by_code.get(parent_code)
+                    if not parent or parent_code in with_ancestors:
+                        break
+                    with_ancestors.add(parent_code)
+                    current = parent
+            visible_codes = with_ancestors
+
+        filtered_items = [item for item in merged if item["code"] in visible_codes]
+        total_visible = len(filtered_items)
+        total_balance_visible = sum(float(item.get("balance", 0) or 0) for item in filtered_items)
+
+        return {
+            "year": int(year),
+            "scopeType": scope_type,
+            "scopeId": scope_id,
+            "tree": _build_tree(filtered_items),
+            "meta": {
+                "assignedOnly": bool(assigned_only),
+                "includeZero": bool(include_zero),
+                "totalAssigned": len(all_assigned_codes),
+                "totalVisible": total_visible,
+                "totalBalanceVisible": total_balance_visible,
+            },
+        }
 
     @staticmethod
     def init_scope(year: int, scope_type: str, scope_id: str, mode: str = "detail_only") -> Dict[str, Any]:

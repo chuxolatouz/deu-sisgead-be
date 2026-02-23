@@ -106,6 +106,20 @@
 
 - `GET /api/accounts/search?year=2025&q=&group=&scopeType=&scopeId=`
 
+### Cuentas por proyecto/departamento (árbol)
+
+- `GET /api/projects/:projectId/accounts?year=2025&assignedOnly=true|false&includeZero=true|false`
+- `GET /api/departments/:departmentId/accounts?year=2025&assignedOnly=true|false&includeZero=true|false`
+- Defaults compatibles:
+  - `assignedOnly=false`
+  - `includeZero=true`
+- Meta en respuesta:
+  - `meta.assignedOnly`
+  - `meta.includeZero`
+  - `meta.totalAssigned`
+  - `meta.totalVisible`
+  - `meta.totalBalanceVisible`
+
 ### Transferencia entre cuentas
 
 - `POST /api/admin/accounts/transfer`

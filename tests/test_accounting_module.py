@@ -232,3 +232,114 @@ def test_transfer_between_accounts_actualiza_ambas(monkeypatch):
     assert result["sourceState"]["balance"] == 300.0
     assert result["targetState"]["balance"] == 200.0
     assert len(mongo_stub.db.ledger_movements.rows) == 2
+
+
+def test_get_scope_accounts_assigned_only_include_zero_filters(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+
+    mongo_stub.db.master_accounts.rows.extend(
+        [
+            {
+                "year": 2025,
+                "code": "100000000000",
+                "description": "Raiz",
+                "group": "EGRESO",
+                "is_header": True,
+                "level": 1,
+                "parent_code": None,
+            },
+            {
+                "year": 2025,
+                "code": "100100000000",
+                "description": "Sub raiz",
+                "group": "EGRESO",
+                "is_header": True,
+                "level": 2,
+                "parent_code": "100000000000",
+            },
+            {
+                "year": 2025,
+                "code": "100100100000",
+                "description": "Detalle A",
+                "group": "EGRESO",
+                "is_header": False,
+                "level": 3,
+                "parent_code": "100100000000",
+            },
+            {
+                "year": 2025,
+                "code": "100100200000",
+                "description": "Detalle B",
+                "group": "EGRESO",
+                "is_header": False,
+                "level": 3,
+                "parent_code": "100100000000",
+            },
+        ]
+    )
+
+    # Dos cuentas asignadas al scope: una con saldo y otra en 0.
+    mongo_stub.db.account_scope_state.rows.extend(
+        [
+            {
+                "year": 2025,
+                "scopeType": "project",
+                "scopeId": "proj-1",
+                "accountCode": "100100100000",
+                "balance": 300.0,
+                "movementsCount": 2,
+                "lastMovementAt": None,
+            },
+            {
+                "year": 2025,
+                "scopeType": "project",
+                "scopeId": "proj-1",
+                "accountCode": "100100200000",
+                "balance": 0.0,
+                "movementsCount": 0,
+                "lastMovementAt": None,
+            },
+        ]
+    )
+
+    # assignedOnly + includeZero=false: solo no-cero + ancestros.
+    payload_no_zero = AccountScopeService.get_scope_accounts(
+        year=2025,
+        scope_type="project",
+        scope_id="proj-1",
+        assigned_only=True,
+        include_zero=False,
+    )
+
+    def _flatten(nodes):
+        out = []
+        for node in nodes:
+            out.append(node)
+            out.extend(_flatten(node.get("children", [])))
+        return out
+
+    flat_no_zero = _flatten(payload_no_zero["tree"])
+    codes_no_zero = {row["code"] for row in flat_no_zero}
+
+    assert "100100100000" in codes_no_zero
+    assert "100100200000" not in codes_no_zero
+    # Ancestros preservados para mantener jerarquía.
+    assert "100100000000" in codes_no_zero
+    assert "100000000000" in codes_no_zero
+    assert payload_no_zero["meta"]["assignedOnly"] is True
+    assert payload_no_zero["meta"]["includeZero"] is False
+    assert payload_no_zero["meta"]["totalAssigned"] == 2
+
+    # assignedOnly + includeZero=true: incluye asignadas en 0.
+    payload_with_zero = AccountScopeService.get_scope_accounts(
+        year=2025,
+        scope_type="project",
+        scope_id="proj-1",
+        assigned_only=True,
+        include_zero=True,
+    )
+    flat_with_zero = _flatten(payload_with_zero["tree"])
+    codes_with_zero = {row["code"] for row in flat_with_zero}
+    assert "100100100000" in codes_with_zero
+    assert "100100200000" in codes_with_zero

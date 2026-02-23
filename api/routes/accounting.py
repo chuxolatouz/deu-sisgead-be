@@ -97,6 +97,12 @@ def _allow_negative_balances() -> bool:
     return os.getenv("ACCOUNTING_ALLOW_NEGATIVE", "true").strip().lower() in {"1", "true", "yes", "si"}
 
 
+def _query_truthy(value: Optional[str], default: bool = False) -> bool:
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "si", "on"}
+
+
 @accounting_bp.route("/accounts/tree", methods=["GET"])
 @accounting_bp.route("/api/accounts/tree", methods=["GET"])
 @allow_cors
@@ -131,7 +137,16 @@ def get_department_accounts(user, department_id):
 
     year = _parse_year()
     group = request.args.get("group")
-    payload = AccountScopeService.get_scope_accounts(year=year, scope_type="department", scope_id=department_id, group=group)
+    assigned_only = _query_truthy(request.args.get("assignedOnly"), default=False)
+    include_zero = _query_truthy(request.args.get("includeZero"), default=True)
+    payload = AccountScopeService.get_scope_accounts(
+        year=year,
+        scope_type="department",
+        scope_id=department_id,
+        group=group,
+        assigned_only=assigned_only,
+        include_zero=include_zero,
+    )
     return jsonify(payload), 200
 
 
@@ -199,7 +214,16 @@ def get_project_accounts(user, project_id):
 
     year = _parse_year()
     group = request.args.get("group")
-    payload = AccountScopeService.get_scope_accounts(year=year, scope_type="project", scope_id=str(project_id), group=group)
+    assigned_only = _query_truthy(request.args.get("assignedOnly"), default=False)
+    include_zero = _query_truthy(request.args.get("includeZero"), default=True)
+    payload = AccountScopeService.get_scope_accounts(
+        year=year,
+        scope_type="project",
+        scope_id=str(project_id),
+        group=group,
+        assigned_only=assigned_only,
+        include_zero=include_zero,
+    )
     return jsonify(payload), 200
 
 
