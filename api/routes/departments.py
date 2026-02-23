@@ -7,6 +7,24 @@ from api.util.decorators import token_required, allow_cors, validar_datos
 
 departments_bp = Blueprint('departments', __name__)
 
+
+def _serialize_cursor(cursor):
+    list_cursor = list(cursor)
+    list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
+    return json.loads(list_dump.replace("\\", ""))
+
+
+def _user_department_id(user):
+    dep = user.get("departmentId") or user.get("departamento_id")
+    return str(dep) if dep else None
+
+
+def _can_access_department(user, departamento_id):
+    if user.get("role") == "super_admin":
+        return True
+    user_dep = _user_department_id(user)
+    return bool(user_dep and user_dep == str(departamento_id))
+
 @departments_bp.route("/departamentos", methods=["POST"])
 @allow_cors
 @token_required
@@ -109,11 +127,22 @@ def listar_departamentos():
     if params.get("activo") is not None:
         query["activo"] = params.get("activo").lower() == "true"
     
-    departamentos = mongo.db.departamentos.find(query)
-    list_cursor = list(departamentos)
-    list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
-    return jsonify(list_json), 200
+    has_pagination = params.get("page") is not None or params.get("limit") is not None
+    if not has_pagination:
+        departamentos = mongo.db.departamentos.find(query)
+        return jsonify(_serialize_cursor(departamentos)), 200
+
+    page = int(params.get("page")) if params.get("page") else 0
+    limit = int(params.get("limit")) if params.get("limit") else 10
+    if limit <= 0:
+        limit = 10
+    if page < 0:
+        page = 0
+    skip = page * limit
+
+    departamentos = mongo.db.departamentos.find(query).skip(skip).limit(limit)
+    count = mongo.db.departamentos.count_documents(query)
+    return jsonify(request_list=_serialize_cursor(departamentos), count=count), 200
 
 @departments_bp.route("/departamentos/<string:departamento_id>", methods=["GET"])
 @allow_cors
@@ -254,6 +283,76 @@ def eliminar_departamento(user, departamento_id):
     else:
         return jsonify({"message": "No se pudo eliminar el departamento"}), 400
 
+
+@departments_bp.route("/departamentos/<string:departamento_id>/proyectos", methods=["GET"])
+@allow_cors
+@token_required
+def listar_proyectos_departamento(user, departamento_id):
+    if not _can_access_department(user, departamento_id):
+        return jsonify({"message": "No autorizado para consultar proyectos de este departamento"}), 403
+
+    try:
+        departamento_obj_id = ObjectId(departamento_id.strip())
+    except Exception:
+        return jsonify({"message": "ID de departamento inválido"}), 400
+
+    page = int(request.args.get("page")) if request.args.get("page") else 0
+    limit = int(request.args.get("limit")) if request.args.get("limit") else 10
+    if limit <= 0:
+        limit = 10
+    if page < 0:
+        page = 0
+    skip = page * limit
+
+    query = {"departamento_id": departamento_obj_id}
+    projection = {"miembros.usuario.password": 0}
+    projects = mongo.db.proyectos.find(query, projection=projection).skip(skip).limit(limit)
+    count = mongo.db.proyectos.count_documents(query)
+    payload = _serialize_cursor(projects)
+    for item in payload:
+        dep_id = item.get("departamento_id")
+        if isinstance(dep_id, dict):
+            dep_id = dep_id.get("$oid")
+            item["departamento_id"] = dep_id
+        if dep_id:
+            item["departmentId"] = dep_id
+    return jsonify(request_list=payload, count=count), 200
+
+
+@departments_bp.route("/departamentos/<string:departamento_id>/usuarios", methods=["GET"])
+@allow_cors
+@token_required
+def listar_usuarios_departamento(user, departamento_id):
+    if not _can_access_department(user, departamento_id):
+        return jsonify({"message": "No autorizado para consultar usuarios de este departamento"}), 403
+
+    try:
+        departamento_obj_id = ObjectId(departamento_id.strip())
+    except Exception:
+        return jsonify({"message": "ID de departamento inválido"}), 400
+
+    page = int(request.args.get("page")) if request.args.get("page") else 0
+    limit = int(request.args.get("limit")) if request.args.get("limit") else 10
+    if limit <= 0:
+        limit = 10
+    if page < 0:
+        page = 0
+    skip = page * limit
+
+    query = {"departamento_id": departamento_obj_id}
+    projection = {"password": 0}
+    users = mongo.db.usuarios.find(query, projection=projection).skip(skip).limit(limit)
+    count = mongo.db.usuarios.count_documents(query)
+    payload = _serialize_cursor(users)
+    for item in payload:
+        dep_id = item.get("departamento_id")
+        if isinstance(dep_id, dict):
+            dep_id = dep_id.get("$oid")
+            item["departamento_id"] = dep_id
+        if dep_id:
+            item["departmentId"] = dep_id
+    return jsonify(request_list=payload, count=count), 200
+
 @departments_bp.route("/contexto_departamento", methods=["GET"])
 @allow_cors
 @token_required
@@ -317,8 +416,10 @@ def obtener_contexto_departamento(user):
         except Exception:
             pass
     
+    resolved_department_id = dept_context.strip() if dept_context and usando_contexto else None
     return jsonify({
-        "departamento_id": dept_context.strip() if dept_context and usando_contexto else None,
+        "departamento_id": resolved_department_id,
+        "departmentId": resolved_department_id,
         "usando_contexto": usando_contexto,
         "departamento": departamento
     }), 200

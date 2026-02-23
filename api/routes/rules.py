@@ -10,6 +10,13 @@ from api.util.utils import int_to_string, actualizar_pasos
 
 rules_bp = Blueprint('rules', __name__)
 
+
+def _pick_value(data, *keys):
+    for key in keys:
+        if key in data and data.get(key) not in (None, ""):
+            return data.get(key)
+    return None
+
 @rules_bp.route("/crear_solicitud_regla_fija", methods=["POST"])
 @token_required
 def crear_solicitud_regla_fija(user):
@@ -194,9 +201,11 @@ def asignar_regla_fija(user):
       404:
         description: Proyecto o regla no encontrado
     """
-    data = request.get_json()
-    proyecto_id = data["proyecto_id"]
-    regla_id = data["regla_id"]
+    data = request.get_json(silent=True) or {}
+    proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
+    regla_id = _pick_value(data, "ruleId", "rule_id", "regla_id")
+    if not proyecto_id or not regla_id:
+        return jsonify({"message": "projectId y ruleId son requeridos"}), 400
 
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
     if proyecto is None:

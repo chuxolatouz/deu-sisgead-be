@@ -6,6 +6,13 @@ from api.util.decorators import token_required, allow_cors, validar_datos
 
 users_bp = Blueprint('users', __name__)
 
+
+def _pick_value(data, *keys):
+    for key in keys:
+        if key in data and data.get(key) not in (None, ""):
+            return data.get(key)
+    return None
+
 @users_bp.route("/editar_usuario/<id_usuario>", methods=["PUT"])
 @token_required
 def editar_usuario(id_usuario):
@@ -66,8 +73,10 @@ def eliminar_usuario(user):
       400:
         description: No se pudo eliminar
     """
-    data = request.get_json()
-    id_usuario = data["id_usuario"]
+    data = request.get_json(silent=True) or {}
+    id_usuario = _pick_value(data, "idUsuario", "id_usuario", "userId")
+    if not id_usuario:
+        return jsonify({"message": "idUsuario es requerido"}), 400
     result = mongo.db.usuarios.delete_one({"_id": ObjectId(id_usuario)})
 
     if result.deleted_count == 1:
@@ -156,9 +165,11 @@ def asignar_rol():
       200:
         description: Rol asignado
     """
-    data = request.get_json()
-    user_id = data["user_id"]
-    rol_id = data["rol_id"]
+    data = request.get_json(silent=True) or {}
+    user_id = _pick_value(data, "userId", "user_id")
+    rol_id = _pick_value(data, "roleId", "rol_id")
+    if not user_id or not rol_id:
+        return jsonify({"message": "userId y roleId son requeridos"}), 400
     mongo.db.usuarios.update_one(
         {"_id": ObjectId(user_id)}, {"$set": {"rol_id": ObjectId(rol_id)}}
     )
@@ -203,10 +214,10 @@ def cambiar_rol_usuario(user):
       404:
         description: Usuario no encontrado
     """
-    data = request.get_json()
-    usuario_id = data.get("id")
-    nuevo_rol = data.get("rol")
-    departamento_id = data.get("departamento_id")
+    data = request.get_json(silent=True) or {}
+    usuario_id = _pick_value(data, "id", "userId")
+    nuevo_rol = _pick_value(data, "rol", "role")
+    departamento_id = _pick_value(data, "departmentId", "departamento_id")
 
     roles_permitidos = ["usuario", "admin_departamento", "super_admin"]
     if nuevo_rol not in roles_permitidos:
@@ -226,7 +237,7 @@ def cambiar_rol_usuario(user):
             update_data["departamento_id"] = ObjectId(departamento_id)
         except Exception:
             return jsonify({"message": "ID de departamento inválido"}), 400
-    elif "departamento_id" in data and data["departamento_id"] is None:
+    elif ("departamento_id" in data and data["departamento_id"] is None) or ("departmentId" in data and data["departmentId"] is None):
         update_data["departamento_id"] = None
 
     mongo.db.usuarios.update_one(

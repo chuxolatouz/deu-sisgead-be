@@ -14,6 +14,21 @@ from api.util.backblaze import upload_file
 
 documents_bp = Blueprint('documents', __name__)
 
+
+def _pick_form_value(*keys):
+    for key in keys:
+        value = request.form.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _pick_json_value(data, *keys):
+    for key in keys:
+        if key in data and data.get(key) not in (None, ""):
+            return data.get(key)
+    return None
+
 @documents_bp.route("/proyecto/<string:id>/documentos", methods=["GET"])
 @allow_cors
 def mostrar_documentos_proyecto(id):
@@ -70,6 +85,19 @@ def mostrar_documentos_proyecto(id):
     list_cursor = list(documentos)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))
+    for documento in list_json:
+        project_id = documento.get("project_id")
+        if isinstance(project_id, dict):
+            documento["projectId"] = project_id.get("$oid")
+        elif project_id:
+            documento["projectId"] = str(project_id)
+
+        if "objetivo_especifico" in documento:
+            documento["specificObjective"] = documento.get("objetivo_especifico")
+        if "monto_transferencia" in documento:
+            documento["transferAmount"] = documento.get("monto_transferencia")
+        if "cuenta_contable" in documento:
+            documento["accountCode"] = documento.get("cuenta_contable")
     return jsonify(request_list=list_json, count=quantity)
 
 @documents_bp.route("/documento_crear", methods=["POST"])
@@ -119,10 +147,10 @@ def crear_presupuesto(user):
       400:
         description: Campos requeridos faltantes
     """
-    project_id = request.form.get("proyecto_id")
+    project_id = _pick_form_value("projectId", "project_id", "proyecto_id")
     descripcion = request.form.get("descripcion")
     monto = request.form.get("monto")
-    objetivo_especifico = request.form.get("objetivo_especifico")
+    objetivo_especifico = _pick_form_value("specificObjective", "objetivo_especifico")
 
     if not project_id or not descripcion or not monto:
         return jsonify({"error": "Missing required fields"}), 400
@@ -222,18 +250,21 @@ def cerrar_presupuesto(user):
       400:
         description: Monto excede saldo disponible
     """
-    id = request.form.get("proyecto_id")
-    doc_id = request.form.get("doc_id")
+    id = _pick_form_value("projectId", "project_id", "proyecto_id")
+    doc_id = _pick_form_value("docId", "doc_id")
     data_balance = request.form.get("monto")
-    data_descripcion = request.form.get("description")
+    data_descripcion = _pick_form_value("description", "descripcion")
     
     # Note: Local file storage code was present in original but mixed with DB updates
     # I kept the logic structure but note that 'files' folder might be ephemeral in some deployments.
     carpeta_proyecto = os.path.join("files", id)
     referencia = request.form.get("referencia")
-    monto_transferencia = request.form.get("monto_transferencia")
+    monto_transferencia = _pick_form_value("transferAmount", "monto_transferencia")
     banco = (request.form.get("banco") or "").strip()
-    cuenta_contable = (request.form.get("cuenta_contable") or "").strip()
+    cuenta_contable = (_pick_form_value("accountCode", "cuenta_contable") or "").strip()
+
+    if not id or not doc_id or not data_balance:
+        return jsonify({"error": "projectId, docId y monto son requeridos"}), 400
 
     if not os.path.exists(carpeta_proyecto):
         os.makedirs(carpeta_proyecto)
@@ -256,8 +287,10 @@ def cerrar_presupuesto(user):
         "total_amount": balance,
         "referencia": referencia,
         "monto_transferencia": monto_transferencia,
+        "transferAmount": monto_transferencia,
         "banco": banco,
         "cuenta_contable": cuenta_contable,
+        "accountCode": cuenta_contable,
         "created_at": datetime.utcnow()
     }
     mongo.db.acciones.insert_one(data_acciones)
@@ -290,8 +323,10 @@ def cerrar_presupuesto(user):
                 "description": data_descripcion,
                 "referencia": referencia,
                 "monto_transferencia": monto_transferencia,
+                "transferAmount": monto_transferencia,
                 "banco": banco,
-                "cuenta_contable": cuenta_contable
+                "cuenta_contable": cuenta_contable,
+                "accountCode": cuenta_contable
             }
         },
     )
@@ -301,13 +336,8 @@ def cerrar_presupuesto(user):
 
     return jsonify({"mensaje": "proyecto ajustado exitosamente"}), 201
 
-@documents_bp.route("/eliminar_presupuesto", methods=["POST"]) # Originally /eliminar_presupuesto but route path was /eliminar_usuario check earlier file... wait.
-# Line 2402 says def eliminar_presupuesto. Line 2401 token_required. 
-# Ah, I missed where the route decoration was exactly. 
-# Looking at line 2399: @app.route("/documento_eliminar", methods=["POST"]) -> def crear_presupuesto... wait, no.
-# Line 2109 is /documento_crear -> crear_presupuesto.
-# Line 2399 is /documento_eliminar. There was a cut off in view_file.
-# Then lines 2401 starts eliminating budget? No, checking logic.
+@documents_bp.route("/eliminar_presupuesto", methods=["POST"])
+@documents_bp.route("/documento_eliminar", methods=["POST"])
 @allow_cors
 @token_required
 def eliminar_presupuesto_route(user): 
@@ -341,16 +371,11 @@ def eliminar_presupuesto_route(user):
       404:
         description: Actividad no encontrada
     """ 
-    # The view_file output around 2399 was cut off. I will assume it maps to eliminating the budget logic seen in 2402.
-    # The function name in 2402 is eliminar_presupuesto.
-    data = request.get_json()
-    presupuesto_id = data.get("budget_id")
-    project_id = data.get("project_id")
-    
-    if not presupuesto_id: 
-         # Fallback if the route was /documento_eliminar and logical flow is dif. Not 100% sure on route path mapping for 2402.
-         # But usually function name follows route.
-         pass
+    data = request.get_json(silent=True) or {}
+    presupuesto_id = _pick_json_value(data, "budgetId", "budget_id")
+    project_id = _pick_json_value(data, "projectId", "project_id", "proyecto_id")
+    if not presupuesto_id:
+        return jsonify({"message": "budgetId es requerido"}), 400
 
     documento = mongo.db.documentos.find_one({"_id": ObjectId(presupuesto_id)})
     if documento is None:

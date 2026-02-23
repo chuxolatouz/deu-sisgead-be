@@ -4,6 +4,22 @@ from functools import wraps
 from api.util.utils import obtener_contexto_departamento_desde_header
 
 
+def _to_camel_case(value):
+    parts = value.split("_")
+    if len(parts) <= 1:
+        return value
+    return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def _to_snake_case(value):
+    output = []
+    for idx, ch in enumerate(value):
+        if ch.isupper() and idx > 0:
+            output.append("_")
+        output.append(ch.lower())
+    return "".join(output)
+
+
 def allow_cors(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -17,11 +33,22 @@ def validar_datos(schema):
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            data = request.get_json()
+            data = request.get_json(silent=True) or {}
             for field, datatype in schema.items():
-                if field not in data:
+                alt_field = _to_camel_case(field) if "_" in field else _to_snake_case(field)
+                selected_field = None
+                if field in data:
+                    selected_field = field
+                elif alt_field in data:
+                    selected_field = alt_field
+
+                if not selected_field:
                     return jsonify({"message": f"El campo '{field}' es requerido"}), 400
-                if not isinstance(data[field], datatype):
+
+                if selected_field != field and field not in data:
+                    data[field] = data[selected_field]
+
+                if not isinstance(data[selected_field], datatype):
                     return jsonify({"message": f"El campo '{field}' debe ser de tipo {datatype.__name__}"}), 400
             return func(*args, **kwargs)
         return wrapper
@@ -51,6 +78,7 @@ def token_required(f):
         contexto_dept = obtener_contexto_departamento_desde_header(data)
         if contexto_dept:
             data["departamento_id"] = contexto_dept
+            data["departmentId"] = contexto_dept
             # Marcar que está usando contexto temporal
             data["_using_dept_context"] = True
             print(f"[DEBUG] Contexto de departamento aplicado: {contexto_dept} para usuario {data.get('email', 'N/A')}")

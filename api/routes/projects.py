@@ -21,6 +21,30 @@ def _sanitize_filename(value):
     return safe or "proyecto"
 
 
+def _pick_value(data, *keys):
+    for key in keys:
+        if key in data and data.get(key) not in (None, ""):
+            return data.get(key)
+    return None
+
+
+def _normalize_project_payload(data):
+    alias_map = {
+        "fechaInicio": "fecha_inicio",
+        "fechaFin": "fecha_fin",
+        "objetivoGeneral": "objetivo_general",
+        "objetivosEspecificos": "objetivos_especificos",
+        "departmentId": "departamento_id",
+    }
+    for source_key, target_key in alias_map.items():
+        if source_key in data and target_key not in data:
+            data[target_key] = data[source_key]
+    for source_key in alias_map.keys():
+        if source_key in data:
+            data.pop(source_key, None)
+    return data
+
+
 def _get_project_or_404(project_id):
     try:
         object_id = ObjectId(project_id.strip())
@@ -90,27 +114,28 @@ def crear_proyecto(user):
         description: Categoría o departamento no encontrado
     """
     current_user = user["sub"]
-    data = request.get_json()
+    data = _normalize_project_payload(request.get_json(silent=True) or {})
     
     
     departamento_id = None
-    if "departamento_id" in data and data["departamento_id"]:
+    payload_department_id = _pick_value(data, "departmentId", "department_id", "departamento_id")
+    if payload_department_id:
         try:
-            dept_id_obj = ObjectId(data["departamento_id"])
+            dept_id_obj = ObjectId(str(payload_department_id))
             departamento = mongo.db.departamentos.find_one({"_id": dept_id_obj})
             if not departamento:
                 return jsonify({"message": "Departamento no encontrado"}), 400
             departamento_id = dept_id_obj
         except Exception:
             return jsonify({"message": "ID de departamento inválido"}), 400
-    elif user.get("_using_dept_context") and "departamento_id" in user:
+    elif user.get("_using_dept_context") and ("departamento_id" in user or "departmentId" in user):
         try:
-            departamento_id = ObjectId(user["departamento_id"])
+            departamento_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
         except Exception:
             pass
-    elif user.get("role") == "admin_departamento" and "departamento_id" in user:
+    elif user.get("role") == "admin_departamento" and ("departamento_id" in user or "departmentId" in user):
         try:
-            departamento_id = ObjectId(user["departamento_id"])
+            departamento_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
         except Exception:
             pass
     
@@ -182,7 +207,7 @@ def actualizar_proyecto(user, project_id):
       404:
         description: Proyecto no encontrado
     """
-    data = request.get_json()
+    data = _normalize_project_payload(request.get_json(silent=True) or {})
     project = mongo.db.proyectos.find_one({"_id": ObjectId(project_id)})
     if not project:
         return jsonify({"message": "Proyecto no encontrado"}), 404
@@ -236,19 +261,25 @@ def asignar_usuario_proyecto(user):
         description: Usuario ya es miembro
     """
     data = request.get_json()
-    proyecto_id = data["proyecto_id"]
-    usuario = data["usuario"]
+    proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
+    usuario = _pick_value(data, "user", "usuario")
+    if not proyecto_id or not usuario or "role" not in data:
+        return jsonify({"message": "projectId, user y role son requeridos"}), 400
     fecha_hora_actual = datetime.now(timezone.utc)
-    data["fecha_ingreso"] = fecha_hora_actual.strftime("%d/%m/%Y %H:%M")
+    member_payload = {
+        "usuario": usuario,
+        "role": data["role"],
+        "fecha_ingreso": fecha_hora_actual.strftime("%d/%m/%Y %H:%M")
+    }
     
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
     miembros = proyecto["miembros"]
 
-    if any(miembro["usuario"]["_id"]["$oid"] == data["usuario"]["_id"]["$oid"] for miembro in miembros):
+    if any(miembro["usuario"]["_id"]["$oid"] == usuario["_id"]["$oid"] for miembro in miembros):
         return jsonify({"message": "El usuario ya es miembro del proyecto"}), 400
 
     new_status = {}
-    query = {"$push": {"miembros": data}}
+    query = {"$push": {"miembros": member_payload}}
     
     if 2 not in proyecto["status"]["completado"]:
         new_status, _ = actualizar_pasos(proyecto["status"], 2)
@@ -296,8 +327,10 @@ def eliminar_usuario_proyecto(user):
         description: Usuario no es miembro
     """
     data = request.get_json()
-    proyecto_id = data["proyecto_id"]
-    usuario_id = data["usuario_id"]
+    proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
+    usuario_id = _pick_value(data, "userId", "usuario_id", "user_id")
+    if not proyecto_id or not usuario_id:
+        return jsonify({"message": "projectId y userId son requeridos"}), 400
 
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
     usuario = None
@@ -346,8 +379,10 @@ def asignar_regla_distribucion(user):
         description: Regla establecida
     """
     data = request.get_json()
-    proyecto_id = data["proyecto_id"]
-    regla_distribucion = data["regla_distribucion"]
+    proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
+    regla_distribucion = _pick_value(data, "distributionRule", "regla_distribucion")
+    if not proyecto_id or not isinstance(regla_distribucion, dict):
+        return jsonify({"message": "projectId y distributionRule son requeridos"}), 400
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
 
     if 4 not in proyecto["status"]["completado"]:
@@ -393,10 +428,23 @@ def asignar_balance(user):
       200:
         description: Balance asignado
     """
-    data = request.get_json()
-    proyecto_id = data["project_id"]
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
-    data_balance = string_to_int(data["balance"])
+    data = request.get_json(silent=True) or {}
+    proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
+    if not proyecto_id:
+        return jsonify({"message": "projectId es requerido"}), 400
+
+    try:
+        proyecto_object_id = ObjectId(str(proyecto_id))
+    except Exception:
+        return jsonify({"message": "projectId inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": proyecto_object_id})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+    if "balance" not in data:
+        return jsonify({"message": "balance es requerido"}), 400
+
+    data_balance = string_to_int(data.get("balance"))
     balance = data_balance + int(proyecto["balance"])
     new_changes = {"balance": balance}
 
@@ -405,9 +453,9 @@ def asignar_balance(user):
         new_changes["status"] = new_status
         new_changes["balance_inicial"] = balance
 
-    mongo.db.proyectos.update_one({"_id": ObjectId(proyecto_id)}, {"$set": new_changes})
+    mongo.db.proyectos.update_one({"_id": proyecto_object_id}, {"$set": new_changes})
     data_acciones = {
-        "project_id": ObjectId(proyecto_id),
+        "project_id": proyecto_object_id,
         "user": "Prueba", # TODO: Fix user name
         "type": "Fondeo",
         "amount": data_balance,
@@ -416,7 +464,7 @@ def asignar_balance(user):
     }
     mongo.db.acciones.insert_one(data_acciones)
     message_log = f'{user["nombre"]} agrego balance al proyecto por un monto de: Bs. {int_to_string(data_balance)}'
-    agregar_log(proyecto_id, message_log)
+    agregar_log(proyecto_object_id, message_log)
 
     return jsonify({"message": "Balance asignado con éxito"}), 200
 
@@ -468,9 +516,9 @@ def mostrar_proyectos(user):
     }
     
     if user.get("role") == "super_admin":
-        if user.get("_using_dept_context") and "departamento_id" in user:
+        if user.get("_using_dept_context") and ("departamento_id" in user or "departmentId" in user):
             try:
-                dept_id = ObjectId(user["departamento_id"])
+                dept_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
                 query = {
                     "$or": [
                         {"departamento_id": dept_id},
@@ -482,9 +530,9 @@ def mostrar_proyectos(user):
                 query = {}
         else:
             query = {} 
-    elif user.get("role") == "admin_departamento" and "departamento_id" in user:
+    elif user.get("role") == "admin_departamento" and ("departamento_id" in user or "departmentId" in user):
         try:
-            dept_id = ObjectId(user["departamento_id"])
+            dept_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
             query = {
                 "$or": [
                     {"departamento_id": dept_id},
@@ -502,6 +550,13 @@ def mostrar_proyectos(user):
     list_cursor = list(list_verification_request)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))
+    for project in list_json:
+        departamento_id = project.get("departamento_id")
+        if isinstance(departamento_id, dict):
+            departamento_id = departamento_id.get("$oid")
+            project["departamento_id"] = departamento_id
+        if departamento_id:
+            project["departmentId"] = departamento_id
     return jsonify(request_list=list_json, count=quantity)
 
 @projects_bp.route('/proyecto/<string:proyecto_id>/objetivos', methods=['GET'])
@@ -626,6 +681,9 @@ def proyecto(id):
     proyecto["balance"] = balance
     proyecto["owner"] = str(proyecto["owner"])
     proyecto["balance_inicial"] = balance_inicial
+    if proyecto.get("departamento_id"):
+        proyecto["departamento_id"] = str(proyecto["departamento_id"])
+        proyecto["departmentId"] = proyecto["departamento_id"]
 
     if "regla_fija" in proyecto:
         proyecto["regla_fija"]["_id"] = str(proyecto["regla_fija"]["_id"])
@@ -659,8 +717,10 @@ def eliminar_proyecto(user):
       404:
         description: Proyecto no encontrado
     """
-    data = request.get_json()
-    id = data["proyecto_id"]
+    data = request.get_json(silent=True) or {}
+    id = _pick_value(data, "projectId", "project_id", "proyecto_id")
+    if not id:
+        return jsonify({"message": "projectId es requerido"}), 400
     documento = mongo.db.proyectos.find_one({"_id": ObjectId(id)})
     if documento is None:
         return jsonify({"message": "Proyecto no encontrado"}), 404
@@ -699,19 +759,22 @@ def finalizar_proyecto(user):
       404:
         description: Proyecto no encontrado
     """
-    data = request.get_json()
-    proyecto_id = data.get("proyecto_id")
+    data = request.get_json(silent=True) or {}
+    proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
+    if not proyecto_id:
+        return jsonify({"message": "projectId es requerido"}), 400
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
     if not proyecto:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    movimientos = list(mongo.db.acciones.find({"proyecto_id": ObjectId(proyecto_id)}))
+    project_object_id = ObjectId(proyecto_id)
+    movimientos = list(mongo.db.acciones.find({"$or": [{"project_id": project_object_id}, {"proyecto_id": project_object_id}]}))
     movimientos_simple = [{"type": m.get("type"), "amount": m.get("amount", 0), "user": m.get("user", "N/A")} for m in movimientos]
 
-    logs = list(mongo.db.logs.find({"proyecto_id": ObjectId(proyecto_id)}))
+    logs = list(mongo.db.logs.find({"$or": [{"proyecto_id": project_object_id}, {"id_proyecto": project_object_id}]}))
     logs_simple = [{"fecha": str(ls.get("fecha_creacion")), "mensaje": ls.get("mensaje")} for ls in logs]
 
-    presupuestos = list(mongo.db.documentos.find({"proyecto_id": ObjectId(proyecto_id)}))
+    presupuestos = list(mongo.db.documentos.find({"$or": [{"project_id": project_object_id}, {"proyecto_id": project_object_id}]}))
     presupuestos_simple = [{"descripcion": b.get("descripcion", ""), "monto_aprobado": b.get("monto_aprobado", 0)} for b in presupuestos]
 
     mongo.db.proyectos.update_one(
@@ -857,4 +920,3 @@ def mostrar_finalizacion(id):
     logs_json = json.loads(json_util.dumps(list(logs)).replace("\\", ""))
 
     return jsonify(logs=logs_json, documentos=docs_json, movimientos=movs_json), 200
-

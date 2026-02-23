@@ -63,9 +63,11 @@ def generar_token(usuario, secret):
         "exp": int(thirty_days_later.timestamp()),
     }
     
-    # Incluir departamento_id si existe
-    if "departamento_id" in usuario and usuario["departamento_id"]:
-        payload["departamento_id"] = str(usuario["departamento_id"])
+    # Incluir departamento si existe (camelCase + legacy)
+    user_department_id = usuario.get("departmentId") or usuario.get("departamento_id")
+    if user_department_id:
+        payload["departamento_id"] = str(user_department_id)
+        payload["departmentId"] = str(user_department_id)
     
     token = jwt.encode(payload, secret, algorithm="HS256")
     return token
@@ -207,4 +209,4 @@ def obtener_contexto_departamento_desde_header(user):
                 return None
     
     # Para otros usuarios, retornar el departamento_id del token si existe
-    return user.get("departamento_id")
+    return user.get("departmentId") or user.get("departamento_id")

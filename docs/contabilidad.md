@@ -70,6 +70,16 @@ Fallback durante seed:
 - `POST /api/admin/accounts/transfer`
 - `POST /api/admin/accounts/movements` (scope `department|project|global`)
 
+## Contrato de nombres (actual)
+
+- Estándar vigente: `camelCase`.
+- Compatibilidad temporal (1 release): los endpoints críticos aceptan alias `snake_case` heredados.
+
+Ejemplos:
+- Transferencia: `fromScopeType/fromScopeId/toScopeType/toScopeId` (legacy: `scopeType/scopeId`).
+- Movimientos: `accountCode`, `scopeType`, `scopeId`.
+- Actividades finalizadas (módulo proyectos): `accountCode`, `transferAmount` (legacy: `cuenta_contable`, `monto_transferencia`).
+
 ## Ejemplos de payload
 
 ### Crear movimiento (department/project)
@@ -102,6 +112,24 @@ Fallback durante seed:
   "toAccountDescription": "Materiales y suministros",
   "amount": 250,
   "description": "Transferencia interna"
+}
+```
+
+### Cargar saldo sin transferir (admin, cualquier scope)
+
+```json
+{
+  "year": 2025,
+  "scopeType": "global",
+  "scopeId": "global",
+  "accountCode": "401010100000",
+  "type": "debit",
+  "amount": 500,
+  "description": "Carga inicial de saldo",
+  "reference": {
+    "kind": "initial_balance",
+    "accountDescription": "Caja operativa"
+  }
 }
 ```
 

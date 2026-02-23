@@ -78,6 +78,8 @@ def registrar():
     
     if "departamento_id" in data:
         del data["departamento_id"]
+    if "departmentId" in data:
+        del data["departmentId"]
     
     db_usuarios.insert_one(data)
     return jsonify({"message": "Usuario registrado con éxito"}), 201
@@ -162,8 +164,10 @@ def login():
             "role": role,
         }
         
-        if "departamento_id" in usuario:
-            response_data["departamento_id"] = str(usuario["departamento_id"])
+        user_department_id = usuario.get("departmentId") or usuario.get("departamento_id")
+        if user_department_id:
+            response_data["departamento_id"] = str(user_department_id)
+            response_data["departmentId"] = str(user_department_id)
 
         return jsonify(response_data), 200
     else:

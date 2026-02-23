@@ -35,7 +35,7 @@ def _is_super_admin(user: Dict[str, Any]) -> bool:
 
 
 def _user_department_id(user: Dict[str, Any]) -> Optional[str]:
-    dep = user.get("departamento_id")
+    dep = user.get("departmentId") or user.get("departamento_id")
     if not dep:
         return None
     return str(dep)
