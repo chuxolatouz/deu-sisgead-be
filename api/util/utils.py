@@ -126,6 +126,9 @@ def actualizar_pasos(status, paso, proyecto=None):
 
 
 def generar_csv(movimientos):
+    if movimientos and ("projectBalanceAfter" in movimientos[0] or "occurredAt" in movimientos[0]):
+        return generar_csv_timeline(movimientos)
+
     si = StringIO()  # Usar StringIO en lugar de BytesIO para texto
     cw = csv.writer(si)
 
@@ -157,6 +160,9 @@ def generar_csv(movimientos):
     )
 
 def generar_json(movimientos):
+    if movimientos and ("projectBalanceAfter" in movimientos[0] or "occurredAt" in movimientos[0]):
+        return generar_json_timeline(movimientos)
+
     # Convertir los ObjectId a cadenas y formatear los montos
     movimientos_serializables = []
     for mov in movimientos:
@@ -176,6 +182,73 @@ def generar_json(movimientos):
         mimetype="application/json",
         as_attachment=True,
         download_name="movimientos_proyecto.json"
+    )
+
+
+def generar_csv_timeline(movimientos):
+    si = StringIO()
+    cw = csv.writer(si)
+
+    cw.writerow([
+        "Fecha",
+        "Tipo",
+        "Fuente",
+        "Titulo",
+        "Descripcion",
+        "Partida",
+        "Actor",
+        "Monto",
+        "Saldo Proyecto",
+        "Scope Origen",
+        "Scope Destino",
+    ])
+
+    for mov in movimientos:
+        occurred_at = mov.get("occurredAt")
+        if isinstance(occurred_at, datetime):
+            occurred_at = occurred_at.isoformat()
+        cw.writerow([
+            occurred_at or "",
+            mov.get("type", ""),
+            mov.get("source", ""),
+            mov.get("title", ""),
+            mov.get("description", ""),
+            mov.get("accountCode", ""),
+            mov.get("actorName", ""),
+            "{:.2f}".format(float(mov.get("amount", 0) or 0)),
+            "{:.2f}".format(float(mov.get("projectBalanceAfter", 0) or 0)),
+            f'{mov.get("fromScopeType") or ""}:{mov.get("fromScopeId") or ""}',
+            f'{mov.get("toScopeType") or ""}:{mov.get("toScopeId") or ""}',
+        ])
+
+    output = si.getvalue()
+    return send_file(
+        BytesIO(output.encode()),
+        mimetype="text/csv",
+        as_attachment=True,
+        download_name="timeline_movimientos.csv"
+    )
+
+
+def generar_json_timeline(movimientos):
+    serializable = []
+    for mov in movimientos:
+        item = {}
+        for key, value in mov.items():
+            if isinstance(value, ObjectId):
+                item[key] = str(value)
+            elif isinstance(value, datetime):
+                item[key] = value.isoformat()
+            else:
+                item[key] = value
+        serializable.append(item)
+
+    json_output = json.dumps(serializable, ensure_ascii=False, default=json_util.default)
+    return send_file(
+        BytesIO(json_output.encode("utf-8")),
+        mimetype="application/json",
+        as_attachment=True,
+        download_name="timeline_movimientos.json"
     )
 
 

@@ -1,11 +1,16 @@
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from bson import ObjectId
 from pymongo import UpdateOne
 
+from api import create_app
 from api.routes import accounting as accounting_routes
+from api.routes import projects as project_routes
 from api.services import accounting_service
+from api.services import project_funding_service
 from api.services.accounting_service import AccountScopeService, SeedService
+from api.services.project_funding_service import ProjectFundingService
 
 
 class BulkResult:
@@ -21,8 +26,40 @@ class InMemoryCollection:
     def create_index(self, *args, **kwargs):
         return "idx"
 
+    def _resolve_field(self, row, field):
+        current = row
+        for part in field.split("."):
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                return None
+        return current
+
+    def _assign_field(self, row, field, value):
+        if "." not in field:
+            row[field] = value
+            return
+        current = row
+        parts = field.split(".")
+        for part in parts[:-1]:
+            current = current.setdefault(part, {})
+        current[parts[-1]] = value
+
+    def _match_condition(self, current, expected):
+        if isinstance(expected, dict):
+            if "$in" in expected:
+                return current in expected["$in"]
+            if "$regex" in expected:
+                import re
+                pattern = expected["$regex"]
+                flags = re.I if expected.get("$options") == "i" else 0
+                return re.search(pattern, str(current or ""), flags) is not None
+        return current == expected
+
     def _match(self, row, query):
-        return all(row.get(k) == v for k, v in query.items())
+        if "$or" in query:
+            return any(self._match(row, branch) for branch in query["$or"])
+        return all(self._match_condition(self._resolve_field(row, k), v) for k, v in query.items())
 
     def bulk_write(self, ops, ordered=False):
         upserted = 0
@@ -73,6 +110,9 @@ class InMemoryCollection:
             def limit(self, *_args, **_kwargs):
                 return self
 
+            def skip(self, count):
+                return _Cursor(self[count:])
+
         return _Cursor(out)
 
     def update_one(self, query, update, upsert=False, session=None):
@@ -84,9 +124,13 @@ class InMemoryCollection:
             row.update(update.get("$setOnInsert", {}))
             self.rows.append(row)
         for k, v in update.get("$set", {}).items():
-            row[k] = v
+            self._assign_field(row, k, v)
         for k, v in update.get("$inc", {}).items():
-            row[k] = row.get(k, 0) + v
+            current = self._resolve_field(row, k) or 0
+            self._assign_field(row, k, current + v)
+
+    def count_documents(self, query):
+        return len([r for r in self.rows if self._match(r, query)])
 
     def insert_one(self, doc, session=None):
         self.rows.append(dict(doc))
@@ -111,6 +155,8 @@ class InMemoryDB:
         self.ledger_movements = InMemoryCollection()
         self.proyectos = InMemoryCollection()
         self.departamentos = InMemoryCollection()
+        self.logs = InMemoryCollection()
+        self.acciones = InMemoryCollection()
 
 
 class MongoStub:
@@ -343,3 +389,280 @@ def test_get_scope_accounts_assigned_only_include_zero_filters(monkeypatch):
     codes_with_zero = {row["code"] for row in flat_with_zero}
     assert "100100100000" in codes_with_zero
     assert "100100200000" in codes_with_zero
+
+
+def test_project_funding_summary_legacy_uses_snapshots(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+
+    project = {
+        "_id": ObjectId(),
+        "nombre": "Proyecto Legacy",
+        "balance": 125000,
+        "balance_inicial": 150000,
+        "status": {"actual": 1, "completado": []},
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+
+    summary = ProjectFundingService.build_summary(project, year=2025, user={"role": "super_admin"})
+
+    assert summary["model"]["status"] == "legacy"
+    assert summary["model"]["migrationRequired"] is True
+    assert summary["totals"]["currentAvailable"] == 1250.0
+    assert summary["totals"]["initialAssigned"] == 1500.0
+
+
+def test_allocate_funds_updates_project_and_states(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "agregar_log", lambda *args, **kwargs: None)
+
+    for code in ("401010100000", "401010200000"):
+        mongo_stub.db.master_accounts.rows.append(
+            {
+                "year": 2025,
+                "code": code,
+                "description": "Cuenta detalle",
+                "group": "EGRESO",
+                "is_header": False,
+                "level": 4,
+                "parent_code": "401010000000",
+            }
+        )
+
+    project_id = ObjectId()
+    department_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "nombre": "Proyecto Funding",
+        "departamento_id": department_id,
+        "balance": 0,
+        "balance_inicial": 0,
+        "status": {"actual": 1, "completado": []},
+        "fundingModel": {
+            "version": 2,
+            "status": "active",
+            "configuredAt": None,
+            "migratedAt": None,
+            "migratedBy": None,
+            "initialAssignedAmount": 0,
+            "legacyCurrentBalanceSnapshot": None,
+            "legacyInitialBalanceSnapshot": None,
+            "migrationNote": None,
+        },
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+    mongo_stub.db.account_scope_state.rows.append(
+        {
+            "year": 2025,
+            "scopeType": "department",
+            "scopeId": str(department_id),
+            "accountCode": "401010100000",
+            "balance": 500.0,
+            "movementsCount": 1,
+        }
+    )
+
+    result = ProjectFundingService.allocate_funds(
+        project,
+        year=2025,
+        source_scope_type="department",
+        source_scope_id=str(department_id),
+        allocations=[
+            {
+                "fromAccountCode": "401010100000",
+                "toAccountCode": "401010200000",
+                "amount": 250.0,
+                "description": "Asignacion inicial",
+            }
+        ],
+        user={"sub": "user-1", "nombre": "Admin", "role": "admin_departamento", "departmentId": str(department_id)},
+        allow_negative=False,
+    )
+
+    assert result["fundingSummary"]["totals"]["currentAvailable"] == 250.0
+    assert result["fundingSummary"]["totals"]["initialAssigned"] == 250.0
+    updated_project = mongo_stub.db.proyectos.find_one({"_id": project_id})
+    assert updated_project["fundingModel"]["initialAssignedAmount"] == 25000
+    assert 1 in updated_project["status"]["completado"]
+
+
+def test_migration_requires_exact_total_and_activates_project(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "agregar_log", lambda *args, **kwargs: None)
+
+    for code in ("401010100000", "401010200000"):
+        mongo_stub.db.master_accounts.rows.append(
+            {
+                "year": 2025,
+                "code": code,
+                "description": "Cuenta detalle",
+                "group": "EGRESO",
+                "is_header": False,
+                "level": 4,
+                "parent_code": "401010000000",
+            }
+        )
+
+    project_id = ObjectId()
+    department_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "nombre": "Proyecto Migracion",
+        "departamento_id": department_id,
+        "balance": 100000,
+        "balance_inicial": 120000,
+        "status": {"actual": 1, "completado": []},
+        "fundingModel": {
+            "version": 2,
+            "status": "legacy",
+            "configuredAt": None,
+            "migratedAt": None,
+            "migratedBy": None,
+            "initialAssignedAmount": 0,
+            "legacyCurrentBalanceSnapshot": 100000,
+            "legacyInitialBalanceSnapshot": 120000,
+            "migrationNote": None,
+        },
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+    mongo_stub.db.account_scope_state.rows.append(
+        {
+            "year": 2025,
+            "scopeType": "department",
+            "scopeId": str(department_id),
+            "accountCode": "401010100000",
+            "balance": 1200.0,
+            "movementsCount": 1,
+        }
+    )
+
+    result = ProjectFundingService.allocate_funds(
+        project,
+        year=2025,
+        source_scope_type="department",
+        source_scope_id=str(department_id),
+        allocations=[
+            {
+                "fromAccountCode": "401010100000",
+                "toAccountCode": "401010200000",
+                "amount": 1000.0,
+                "description": "Migracion saldo legacy",
+            }
+        ],
+        user={"sub": "user-1", "nombre": "Admin", "role": "admin_departamento", "departmentId": str(department_id)},
+        allow_negative=False,
+        migration=True,
+        note="Migracion manual",
+    )
+
+    updated_project = mongo_stub.db.proyectos.find_one({"_id": project_id})
+    assert updated_project["fundingModel"]["status"] == "active"
+    assert updated_project["fundingModel"]["initialAssignedAmount"] == 120000
+    assert result["fundingSummary"]["totals"]["currentAvailable"] == 1000.0
+
+
+def test_build_timeline_merges_ledger_and_legacy(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+
+    project_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "nombre": "Proyecto Timeline",
+        "balance": 50000,
+        "balance_inicial": 50000,
+        "status": {"actual": 1, "completado": []},
+        "fundingModel": {
+            "version": 2,
+            "status": "legacy",
+            "configuredAt": None,
+            "migratedAt": None,
+            "migratedBy": None,
+            "initialAssignedAmount": 0,
+            "legacyCurrentBalanceSnapshot": 50000,
+            "legacyInitialBalanceSnapshot": 50000,
+            "migrationNote": None,
+        },
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+    mongo_stub.db.ledger_movements.rows.append(
+        {
+            "_id": ObjectId(),
+            "year": 2025,
+            "scopeType": "project",
+            "scopeId": str(project_id),
+            "accountCode": "401010200000",
+            "type": "debit",
+            "amount": 100.0,
+            "description": "Asignacion",
+            "reference": {"kind": "transfer", "fundingType": "funding", "title": "Asignación de fondos", "actorName": "Admin"},
+            "createdAt": datetime(2025, 1, 10, tzinfo=timezone.utc),
+        }
+    )
+    mongo_stub.db.acciones.rows.append(
+        {
+            "_id": ObjectId(),
+            "project_id": project_id,
+            "user": "Legacy User",
+            "type": "Fondeo",
+            "amount": 50000,
+            "total_amount": 50000,
+            "created_at": datetime(2025, 1, 1),
+        }
+    )
+
+    timeline = ProjectFundingService.build_timeline(project, year=2025)
+
+    assert {item["source"] for item in timeline} == {"ledger", "legacy_action"}
+    assert any(item["type"] == "funding" for item in timeline)
+
+
+def test_descargar_movimientos_exporta_timeline_json(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(project_routes, "ProjectFundingService", ProjectFundingService)
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+
+    project_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "nombre": "Proyecto Export",
+        "balance": 0,
+        "balance_inicial": 0,
+        "status": {"actual": 1, "completado": []},
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+
+    monkeypatch.setattr(
+        project_routes.ProjectFundingService,
+        "build_timeline",
+        lambda *_args, **_kwargs: [
+            {
+                "id": "mov-1",
+                "occurredAt": datetime(2025, 1, 1, tzinfo=timezone.utc),
+                "type": "funding",
+                "source": "ledger",
+                "title": "Asignación de fondos",
+                "description": "Linea 1",
+                "amount": 100.0,
+                "projectBalanceAfter": 100.0,
+                "accountCode": "401010200000",
+                "actorName": "Admin",
+                "reference": {},
+            }
+        ],
+    )
+
+    app = create_app()
+    with app.test_request_context(f"/proyecto/{project_id}/movimientos/descargar?formato=json"):
+        response = project_routes.descargar_movimientos(str(project_id))
+
+    response.direct_passthrough = False
+    payload = response.get_data(as_text=True)
+    assert "Asignación de fondos" in payload
+    assert "projectBalanceAfter" in payload
+    assert 'filename=timeline_movimientos.json' in response.headers.get("Content-Disposition", "")

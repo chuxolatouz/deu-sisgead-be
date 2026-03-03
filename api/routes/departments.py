@@ -4,6 +4,7 @@ import json
 from datetime import datetime, timezone
 from api.extensions import mongo
 from api.util.decorators import token_required, allow_cors, validar_datos
+from api.services.project_funding_service import ProjectFundingService
 
 departments_bp = Blueprint('departments', __name__)
 
@@ -308,7 +309,7 @@ def listar_proyectos_departamento(user, departamento_id):
     projection = {"miembros.usuario.password": 0}
     projects = mongo.db.proyectos.find(query, projection=projection).skip(skip).limit(limit)
     count = mongo.db.proyectos.count_documents(query)
-    payload = _serialize_cursor(projects)
+    payload = _serialize_cursor([ProjectFundingService.decorate_project(project) for project in list(projects)])
     for item in payload:
         dep_id = item.get("departamento_id")
         if isinstance(dep_id, dict):

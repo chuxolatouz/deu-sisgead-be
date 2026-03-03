@@ -94,7 +94,16 @@ class AccountingIndexes:
 
 class AccountCatalogService:
     @staticmethod
-    def search(year: int, q: str = "", group: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    def search(
+        year: int,
+        q: str = "",
+        group: Optional[str] = None,
+        limit: int = 50,
+        scope_type: Optional[str] = None,
+        scope_id: Optional[str] = None,
+        assigned_only: bool = False,
+        include_zero: bool = True,
+    ) -> List[Dict[str, Any]]:
         AccountingIndexes.ensure_indexes()
         query: Dict[str, Any] = {"year": int(year)}
         if group:
@@ -103,8 +112,46 @@ class AccountCatalogService:
             safe_q = str(q).strip()
             query["$or"] = [{"code": {"$regex": safe_q}}, {"description": {"$regex": safe_q, "$options": "i"}}]
 
+        states_by_code: Dict[str, Dict[str, Any]] = {}
+        if scope_type and scope_id:
+            state_rows = list(
+                mongo.db.account_scope_state.find(
+                    {"year": int(year), "scopeType": scope_type, "scopeId": scope_id},
+                    {"_id": 0, "accountCode": 1, "balance": 1, "movementsCount": 1, "lastMovementAt": 1},
+                )
+            )
+            states_by_code = {row["accountCode"]: row for row in state_rows}
+            if assigned_only:
+                visible_codes = set(states_by_code.keys())
+                if not include_zero:
+                    visible_codes = {
+                        code
+                        for code, row in states_by_code.items()
+                        if float(row.get("balance", 0) or 0) != 0 or float(row.get("movementsCount", 0) or 0) > 0
+                    }
+                if not visible_codes:
+                    return []
+                query["code"] = {"$in": sorted(visible_codes)}
+
         cursor = mongo.db.master_accounts.find(query, {"_id": 0}).sort("code", 1).limit(max(1, min(limit, 500)))
-        return list(cursor)
+        rows = list(cursor)
+
+        if scope_type and scope_id:
+            enriched = []
+            for row in rows:
+                state = states_by_code.get(row["code"], {})
+                merged = {
+                    **row,
+                    "balance": float(state.get("balance", 0) or 0),
+                    "movementsCount": int(state.get("movementsCount", 0) or 0),
+                    "lastMovementAt": state.get("lastMovementAt"),
+                    "hasState": row["code"] in states_by_code,
+                }
+                if include_zero or merged["hasState"] or float(merged["balance"]) != 0 or int(merged["movementsCount"]) > 0:
+                    enriched.append(merged)
+            return enriched
+
+        return rows
 
     @staticmethod
     def tree(year: int, group: Optional[str] = None) -> List[Dict[str, Any]]:

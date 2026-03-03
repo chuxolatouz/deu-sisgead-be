@@ -6,6 +6,7 @@ from collections import defaultdict
 
 from api.extensions import mongo
 from api.util.decorators import token_required
+from api.services.project_funding_service import ProjectFundingService
 
 reports_bp = Blueprint('reports', __name__)
 
@@ -71,10 +72,12 @@ def generar_reporte_proyecto(data, proyecto_id):
     if not proyecto:
         return jsonify({"error": "Proyecto no encontrado"}), 404
 
-    presupuestos = list(mongo.db.documentos.find({"proyecto_id": ObjectId(proyecto_id)}))
-
-    saldo_inicial = proyecto.get("balance_inicial", 0)
-    saldo_restante = proyecto.get("balance", 0)
+    presupuestos = list(
+        mongo.db.documentos.find({"$or": [{"project_id": ObjectId(proyecto_id)}, {"proyecto_id": ObjectId(proyecto_id)}]})
+    )
+    report_payload = ProjectFundingService.report_payload(proyecto)
+    saldo_inicial = report_payload["saldo_inicial"]
+    saldo_restante = report_payload["saldo_restante"]
 
     monto_total_presupuestado = sum(p.get("monto", 0) for p in presupuestos)
     monto_total_aprobado = sum(p.get("monto_aprobado", 0) for p in presupuestos if p.get("status") == "finished")
@@ -180,31 +183,11 @@ def obtener_reporte_proyecto(id):
     if not proyecto:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    balance_history = [
-        {
-            "fecha": acc["created_at"].strftime("%Y-%m-%d"),
-            "saldo": acc["total_amount"] / 100
-        }
-        for acc in acciones if "created_at" in acc
-    ]
-
-    egresos_por_tipo = defaultdict(float)
-    for acc in acciones:
-        if acc.get("amount", 0) < 0:
-            egresos_por_tipo[acc.get("type", "Sin tipo")] += abs(acc["amount"]) / 100
-
-    egresos_tipo = [{"tipo": tipo, "monto": monto} for tipo, monto in egresos_por_tipo.items()] 
-
-    # TODO: Implementar resumen completo if needed, current code in index.py ends abruptly? 
-    # Viewing index.py earlier, it ended at 3200 but I didn't see the rest.
-    # However, I have enough context to know it returns balance_history and egresos_tipo.
-    # I will verify the end of obtain_reporte_proyecto logic if I can see it.
-    
-    # Let's return what we have as per standard behavior
+    report_payload = ProjectFundingService.report_payload(proyecto)
     return jsonify({
-        "balance_history": balance_history,
-        "egresos_tipo": egresos_tipo,
-        "resumen": {} # Placeholder as original code was cut off in my view
+        "balance_history": report_payload["balance_history"],
+        "egresos_tipo": report_payload["egresos_tipo"],
+        "resumen": report_payload["resumen"],
     }), 200
 
 @reports_bp.route('/dashboard_global', methods=['GET'])

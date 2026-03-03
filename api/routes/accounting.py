@@ -15,6 +15,7 @@ from api.services.accounting_service import (
     DEFAULT_YEAR,
     AccountingIndexes,
 )
+from api.services.project_funding_service import ProjectFundingService
 from api.util.common import agregar_log
 from api.util.decorators import allow_cors, token_required
 
@@ -123,7 +124,30 @@ def search_accounts(user):
     group = request.args.get("group")
     q = request.args.get("q", "")
     limit = int(request.args.get("limit", "50")) if request.args.get("limit") else 50
-    rows = AccountCatalogService.search(year=year, q=q, group=group, limit=limit)
+    scope_type = request.args.get("scopeType", "").strip()
+    scope_id = request.args.get("scopeId", "").strip()
+    assigned_only = _query_truthy(request.args.get("assignedOnly"), default=False)
+    include_zero = _query_truthy(request.args.get("includeZero"), default=True)
+
+    if scope_type == "department" and scope_id and not _can_access_department(user, scope_id):
+        return _forbidden("No autorizado para consultar cuentas de este departamento")
+    if scope_type == "project" and scope_id:
+        allowed, _ = _can_access_project(user, scope_id)
+        if not allowed:
+            return _forbidden("No autorizado para consultar cuentas de este proyecto")
+    if scope_type == "global" and not _is_super_admin(user):
+        return _forbidden("Solo super_admin puede consultar cuentas globales")
+
+    rows = AccountCatalogService.search(
+        year=year,
+        q=q,
+        group=group,
+        limit=limit,
+        scope_type=scope_type or None,
+        scope_id=scope_id or None,
+        assigned_only=assigned_only,
+        include_zero=include_zero,
+    )
     return jsonify({"year": year, "group": group, "q": q, "results": rows}), 200
 
 
@@ -281,6 +305,93 @@ def post_project_movement(user, project_id):
             agregar_log(project["_id"], f"{user.get('nombre', 'Usuario')} registró movimiento contable {movement_type} {amount_value} en cuenta {account_code}")
         except Exception:
             pass
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
+
+    return jsonify(result), 201
+
+
+@accounting_bp.route("/projects/<string:project_id>/funding-summary", methods=["GET"])
+@accounting_bp.route("/api/projects/<string:project_id>/funding-summary", methods=["GET"])
+@allow_cors
+@token_required
+def get_project_funding_summary(user, project_id):
+    allowed, project = _can_access_project(user, project_id)
+    if not allowed:
+        return _forbidden("No autorizado para consultar este proyecto")
+
+    summary = ProjectFundingService.build_summary(project, year=_parse_year(), user=user)
+    return jsonify(summary), 200
+
+
+@accounting_bp.route("/projects/<string:project_id>/funding-timeline", methods=["GET"])
+@accounting_bp.route("/api/projects/<string:project_id>/funding-timeline", methods=["GET"])
+@allow_cors
+@token_required
+def get_project_funding_timeline(user, project_id):
+    allowed, project = _can_access_project(user, project_id)
+    if not allowed:
+        return _forbidden("No autorizado para consultar este proyecto")
+
+    page = int(request.args.get("page", "0"))
+    limit = int(request.args.get("limit", "20"))
+    payload = ProjectFundingService.timeline_response(project, year=_parse_year(), page=page, limit=limit)
+    return jsonify(payload), 200
+
+
+@accounting_bp.route("/projects/<string:project_id>/funding-allocations", methods=["POST"])
+@accounting_bp.route("/api/projects/<string:project_id>/funding-allocations", methods=["POST"])
+@allow_cors
+@token_required
+def create_project_funding_allocations(user, project_id):
+    allowed, project = _can_access_project(user, project_id)
+    if not allowed:
+        return _forbidden("No autorizado para gestionar este proyecto")
+
+    data = request.get_json(silent=True) or {}
+    allocations = data.get("allocations") or []
+
+    try:
+        result = ProjectFundingService.allocate_funds(
+            project,
+            year=int(data.get("year", _parse_year())),
+            source_scope_type=str(data.get("sourceScopeType", "")).strip(),
+            source_scope_id=str(data.get("sourceScopeId", "")).strip(),
+            allocations=allocations,
+            user=user,
+            allow_negative=_allow_negative_balances(),
+            migration=False,
+        )
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
+
+    return jsonify(result), 201
+
+
+@accounting_bp.route("/projects/<string:project_id>/funding-migration", methods=["POST"])
+@accounting_bp.route("/api/projects/<string:project_id>/funding-migration", methods=["POST"])
+@allow_cors
+@token_required
+def migrate_project_funding(user, project_id):
+    allowed, project = _can_access_project(user, project_id)
+    if not allowed:
+        return _forbidden("No autorizado para gestionar este proyecto")
+
+    data = request.get_json(silent=True) or {}
+    allocations = data.get("allocations") or []
+
+    try:
+        result = ProjectFundingService.allocate_funds(
+            project,
+            year=int(data.get("year", _parse_year())),
+            source_scope_type=str(data.get("sourceScopeType", "")).strip(),
+            source_scope_id=str(data.get("sourceScopeId", "")).strip(),
+            allocations=allocations,
+            user=user,
+            allow_negative=_allow_negative_balances(),
+            migration=True,
+            note=str(data.get("note", "")).strip(),
+        )
     except ValueError as exc:
         return jsonify({"message": str(exc)}), 400
 

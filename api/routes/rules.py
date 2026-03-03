@@ -7,6 +7,7 @@ from api.extensions import mongo
 from api.util.decorators import token_required, allow_cors
 from api.util.common import agregar_log
 from api.util.utils import int_to_string, actualizar_pasos
+from api.services.project_funding_service import ProjectFundingService
 
 rules_bp = Blueprint('rules', __name__)
 
@@ -16,6 +17,10 @@ def _pick_value(data, *keys):
         if key in data and data.get(key) not in (None, ""):
             return data.get(key)
     return None
+
+
+def _clean_str(value):
+    return str(value or "").strip()
 
 @rules_bp.route("/crear_solicitud_regla_fija", methods=["POST"])
 @token_required
@@ -214,37 +219,64 @@ def asignar_regla_fija(user):
     regla = mongo.db.solicitudes.find_one({"_id": ObjectId(regla_id)})
     if regla is None:
         return jsonify({"message": "Regla fija no encontrada"}), 404
+    account_mappings = data.get("accountMappings") or []
+    mapping_by_index = {
+        int(item.get("itemIndex")): _pick_value(item, "accountCode", "account_code")
+        for item in account_mappings
+        if _pick_value(item, "accountCode", "account_code") not in (None, "")
+    }
 
-    if proyecto["balance_inicial"] == 0:
-        return jsonify(
-            {"message": "Antes de asignar regla tienes que asignar balance"}
-        ), 400
+    grouped_amounts = {}
+    normalized_items = []
+    for idx, item in enumerate(regla["reglas"]):
+        account_code = _clean_str(mapping_by_index.get(idx) or item.get("accountCode") or item.get("cuenta_contable"))
+        if not account_code:
+            return jsonify({"message": "Cada item de la regla fija requiere una partida asociada"}), 400
+        amount_units = round(float(item.get("monto", 0) or 0) / 100, 2)
+        grouped_amounts[account_code] = round(grouped_amounts.get(account_code, 0) + amount_units, 2)
+        normalized_items.append({"item": item, "accountCode": account_code, "amountUnits": amount_units})
 
-    balance = int(proyecto["balance"])
+    for account_code, total_amount in grouped_amounts.items():
+        balance = ProjectFundingService._project_balance_for_account(proyecto_id, account_code, year=2025)
+        if (balance - total_amount) < 0:
+            return jsonify({"message": f"Saldo insuficiente en la partida {account_code} para aplicar la regla fija"}), 400
 
-    for x in regla["reglas"]:
-        balance -= x["monto"]
-        mongo.db.proyectos.update_one(
-            {"_id": ObjectId(proyecto_id)}, {"$set": {"balance": balance}}
-        )
-
-        data_acciones = {
-            "project_id": ObjectId(proyecto_id),
-            "user": user["nombre"],
-            "type": x["nombre_regla"],
-            "amount": x["monto"] * -1,
-            "total_amount": balance,
-            "created_at": datetime.utcnow()
-        }
-        mongo.db.acciones.insert_one(data_acciones)
-        message_log = f'{user["nombre"]} asigno la regla: {regla["nombre"]} con el item {x["nombre_regla"]} con un monto de Bs. {int_to_string(x["monto"])}'
-        agregar_log(proyecto_id, message_log)
+    for item_data in normalized_items:
+        item = item_data["item"]
+        account_code = item_data["accountCode"]
+        amount_units = item_data["amountUnits"]
+        try:
+            ProjectFundingService.consume_project_account(
+                proyecto,
+                year=2025,
+                account_code=account_code,
+                amount=amount_units,
+                user=user,
+                description=f"Regla fija {regla['nombre']} - {item['nombre_regla']}",
+                reference={
+                    "kind": "fixed_rule",
+                    "ruleId": str(regla_id),
+                    "projectId": str(proyecto_id),
+                    "actorName": user.get("nombre", "Usuario"),
+                    "title": "Consumo por regla fija",
+                    "accountCode": account_code,
+                    "ruleName": regla["nombre"],
+                    "ruleItemName": item["nombre_regla"],
+                },
+                allow_negative=False,
+                log_message=(
+                    f'{user["nombre"]} asigno la regla {regla["nombre"]} con el item {item["nombre_regla"]} '
+                    f'en la partida {account_code} por Bs. {int_to_string(item["monto"])}'
+                ),
+            )
+        except ValueError as exc:
+            return jsonify({"message": str(exc)}), 400
 
     new_status, _ = actualizar_pasos(proyecto["status"], 5)
 
     mongo.db.proyectos.update_one(
         {"_id": ObjectId(proyecto_id)},
-        {"$set": {"regla_fija": regla, "status": new_status}},
+        {"$set": {"regla_fija": {**regla, "accountMappings": account_mappings}, "status": new_status}},
     )
 
     return jsonify({"message": "La regla se asigno correctamente"}), 200

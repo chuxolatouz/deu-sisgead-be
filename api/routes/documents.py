@@ -11,6 +11,7 @@ from api.util.decorators import token_required, allow_cors
 from api.util.common import agregar_log
 from api.util.utils import string_to_int, int_to_string
 from api.util.backblaze import upload_file
+from api.services.project_funding_service import ProjectFundingService
 
 documents_bp = Blueprint('documents', __name__)
 
@@ -28,6 +29,7 @@ def _pick_json_value(data, *keys):
         if key in data and data.get(key) not in (None, ""):
             return data.get(key)
     return None
+
 
 @documents_bp.route("/proyecto/<string:id>/documentos", methods=["GET"])
 @allow_cors
@@ -265,35 +267,45 @@ def cerrar_presupuesto(user):
 
     if not id or not doc_id or not data_balance:
         return jsonify({"error": "projectId, docId y monto son requeridos"}), 400
+    if not cuenta_contable:
+        return jsonify({"error": "accountCode es requerido"}), 400
 
     if not os.path.exists(carpeta_proyecto):
         os.makedirs(carpeta_proyecto)
         
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(id)})
+    if not proyecto:
+        return jsonify({"error": "Proyecto no encontrado"}), 404
     data_balance_int = string_to_int(data_balance)
-    proyecto_balance = int(proyecto["balance"])
-    balance = proyecto_balance - data_balance_int
+    amount_units = round(data_balance_int / 100, 2)
 
-    if data_balance_int > proyecto_balance:
-      return jsonify({"error": "El monto aprobado excede el saldo disponible del proyecto."}), 400
-    
-    mongo.db.proyectos.update_one({"_id": ObjectId(id)}, {"$set": {"balance": balance}})
-
-    data_acciones = {
-        "project_id": ObjectId(id),
-        "user": user["nombre"],
-        "type": f"Retiro {data_descripcion}",
-        "amount": data_balance_int * -1,
-        "total_amount": balance,
-        "referencia": referencia,
-        "monto_transferencia": monto_transferencia,
-        "transferAmount": monto_transferencia,
-        "banco": banco,
-        "cuenta_contable": cuenta_contable,
-        "accountCode": cuenta_contable,
-        "created_at": datetime.utcnow()
-    }
-    mongo.db.acciones.insert_one(data_acciones)
+    try:
+        ProjectFundingService.consume_project_account(
+            proyecto,
+            year=2025,
+            account_code=cuenta_contable,
+            amount=amount_units,
+            user=user,
+            description=data_descripcion or f"Consumo de actividad {doc_id}",
+            reference={
+                "kind": "project_expense",
+                "budgetId": str(doc_id),
+                "projectId": str(id),
+                "actorName": user.get("nombre", "Usuario"),
+                "title": "Consumo por actividad",
+                "accountCode": cuenta_contable,
+                "referenceNumber": referencia,
+                "bank": banco,
+                "transferAmount": monto_transferencia,
+            },
+            allow_negative=False,
+            log_message=(
+                f'{user["nombre"]} cerro la actividad {data_descripcion} por Bs. {int_to_string(data_balance_int)} '
+                f'imputando la partida {cuenta_contable}'
+            ),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
 
     archivos = request.files.getlist("files")
     archivos_guardados = []
@@ -330,9 +342,6 @@ def cerrar_presupuesto(user):
             }
         },
     )
-
-    message_log = f'{user["nombre"]} cerro la actividad {data_descripcion} con un monto de Bs. {int_to_string(data_balance_int)}'
-    agregar_log(id, message_log)
 
     return jsonify({"mensaje": "proyecto ajustado exitosamente"}), 201
 

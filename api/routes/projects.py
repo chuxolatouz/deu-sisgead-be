@@ -11,6 +11,7 @@ from api.util.common import agregar_log
 from api.util.utils import string_to_int, int_to_string, int_to_float, actualizar_pasos, generar_csv, generar_json, map_to_doc
 from api.util.generar_acta_finalizacion import generar_acta_finalizacion_pdf
 from api.util.backblaze import upload_file
+from api.services.project_funding_service import ProjectFundingService
 
 projects_bp = Blueprint('projects', __name__)
 PLACEHOLDER = "(POR DEFINIR)"
@@ -55,6 +56,15 @@ def _get_project_or_404(project_id):
     if not project:
         return None, (jsonify({"message": "Proyecto no encontrado"}), 404)
     return project, None
+
+
+def _allow_legacy_project_balance() -> bool:
+    value = current_app.config.get("ALLOW_LEGACY_PROJECT_BALANCE")
+    if value is None:
+        value = current_app.config.get("PROJECT_FUNDING_ALLOW_LEGACY_BALANCE")
+    if value is None:
+        value = "true"
+    return str(value).strip().lower() in {"1", "true", "yes", "si"}
 
 
 
@@ -150,6 +160,7 @@ def crear_proyecto(user):
     data["show"] = {"status": False}
     data["owner"] = ObjectId(current_user)
     data["user"] = user
+    data["fundingModel"] = ProjectFundingService.ensure_model({"balance": 0, "balance_inicial": 0}, persist=False)
     
     if departamento_id:
         data["departamento_id"] = departamento_id
@@ -444,6 +455,12 @@ def asignar_balance(user):
     if "balance" not in data:
         return jsonify({"message": "balance es requerido"}), 400
 
+    model = ProjectFundingService.ensure_model(proyecto, persist=True)
+    if model.get("status") in {"active", "pending_migration"}:
+        return jsonify({"message": "Este proyecto usa fondeo por partidas. Utiliza el flujo de asignacion de fondos."}), 409
+    if not _allow_legacy_project_balance():
+        return jsonify({"message": "La carga manual de saldo legacy esta deshabilitada. Migra el proyecto a partidas."}), 409
+
     data_balance = string_to_int(data.get("balance"))
     balance = data_balance + int(proyecto["balance"])
     new_changes = {"balance": balance}
@@ -452,6 +469,10 @@ def asignar_balance(user):
         new_status, _ = actualizar_pasos(proyecto["status"], 1)
         new_changes["status"] = new_status
         new_changes["balance_inicial"] = balance
+
+    new_changes["fundingModel.legacyCurrentBalanceSnapshot"] = balance
+    if int(proyecto.get("balance_inicial", 0) or 0) == 0:
+        new_changes["fundingModel.legacyInitialBalanceSnapshot"] = balance
 
     mongo.db.proyectos.update_one({"_id": proyecto_object_id}, {"$set": new_changes})
     data_acciones = {
@@ -547,7 +568,7 @@ def mostrar_proyectos(user):
 
     list_verification_request = mongo.db.proyectos.find(query, projection=projection).skip(skip).limit(limit)
     quantity = mongo.db.proyectos.count_documents(query)
-    list_cursor = list(list_verification_request)
+    list_cursor = [ProjectFundingService.decorate_project(project) for project in list(list_verification_request)]
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))
     for project in list_json:
@@ -644,7 +665,8 @@ def acciones_proyecto(id):
 
 @projects_bp.route("/proyecto/<string:id>", methods=["GET"])
 @allow_cors
-def proyecto(id):
+@token_required
+def proyecto(user, id):
     """
     Obtener detalles completos de un proyecto
     ---
@@ -675,12 +697,9 @@ def proyecto(id):
     if not proyecto:
         return jsonify({"error": "proyecto no encontrado"}), 404
 
+    proyecto = ProjectFundingService.decorate_project(proyecto, user=user)
     proyecto["_id"] = str(proyecto["_id"])
-    balance = int_to_float(proyecto["balance"])
-    balance_inicial = int_to_float(proyecto["balance_inicial"])
-    proyecto["balance"] = balance
     proyecto["owner"] = str(proyecto["owner"])
-    proyecto["balance_inicial"] = balance_inicial
     if proyecto.get("departamento_id"):
         proyecto["departamento_id"] = str(proyecto["departamento_id"])
         proyecto["departmentId"] = proyecto["departamento_id"]
@@ -768,8 +787,8 @@ def finalizar_proyecto(user):
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
     project_object_id = ObjectId(proyecto_id)
-    movimientos = list(mongo.db.acciones.find({"$or": [{"project_id": project_object_id}, {"proyecto_id": project_object_id}]}))
-    movimientos_simple = [{"type": m.get("type"), "amount": m.get("amount", 0), "user": m.get("user", "N/A")} for m in movimientos]
+    movimientos = ProjectFundingService.build_timeline(proyecto)
+    movimientos_simple = [{"type": m.get("title"), "amount": m.get("amount", 0), "user": m.get("actorName", "N/A")} for m in movimientos]
 
     logs = list(mongo.db.logs.find({"$or": [{"proyecto_id": project_object_id}, {"id_proyecto": project_object_id}]}))
     logs_simple = [{"fecha": str(ls.get("fecha_creacion")), "mensaje": ls.get("mensaje")} for ls in logs]
@@ -783,6 +802,7 @@ def finalizar_proyecto(user):
     )
 
     proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
+    proyecto = ProjectFundingService.decorate_project(proyecto)
     
     try:
         pdf_bytes = generar_acta_finalizacion_pdf(
@@ -873,8 +893,10 @@ def descargar_movimientos(id):
         description: Formato no válido
     """
     id_proyecto = ObjectId(id)
-    movimientos = mongo.db.acciones.find({"project_id": id_proyecto})
-    movimientos_lista = list(movimientos)
+    proyecto = mongo.db.proyectos.find_one({"_id": id_proyecto})
+    if not proyecto:
+        return jsonify({"error": "Proyecto no encontrado"}), 404
+    movimientos_lista = ProjectFundingService.build_timeline(proyecto)
     formato = request.args.get("formato", "csv").lower()
 
     if formato == "csv":
@@ -911,7 +933,11 @@ def mostrar_finalizacion(id):
               type: array
     """
     id = ObjectId(id)
-    movs = mongo.db.acciones.find({"project_id": id})
+    proyecto = mongo.db.proyectos.find_one({"_id": id})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    movs = ProjectFundingService.build_timeline(proyecto)
     docs = mongo.db.documentos.find({"project_id": id})
     logs = mongo.db.logs.find({"id_proyecto": id})
 
