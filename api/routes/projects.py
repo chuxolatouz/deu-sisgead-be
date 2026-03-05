@@ -67,6 +67,65 @@ def _allow_legacy_project_balance() -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "si"}
 
 
+def _normalize_category_reference(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, ObjectId):
+        return str(value)
+    if isinstance(value, dict):
+        if "$oid" in value:
+            return str(value.get("$oid"))
+        if "value" in value and value.get("value"):
+            return str(value.get("value"))
+    return str(value).strip()
+
+
+def _category_is_active(category):
+    return category.get("activo") is not False
+
+
+def _category_is_deleted(category):
+    return category.get("eliminado") is True
+
+
+def _category_matches_reference(category, reference):
+    ref = _normalize_category_reference(reference)
+    if not ref:
+        return False
+    category_id = str(category.get("_id")) if category.get("_id") else None
+    category_value = str(category.get("value")) if category.get("value") else None
+    return ref in {category_id, category_value}
+
+
+def _resolve_category_reference(category_reference, allow_inactive=False, allow_deleted=False, current_reference=None):
+    ref = _normalize_category_reference(category_reference)
+    if not ref:
+        return None, None
+
+    category = None
+    try:
+        category_obj_id = ObjectId(ref)
+        category = mongo.db.categorias.find_one({"_id": category_obj_id})
+    except Exception:
+        category = None
+
+    if not category:
+        category = mongo.db.categorias.find_one({"value": ref})
+
+    if not category:
+        return None, "Categoría no encontrada"
+
+    if _category_is_deleted(category) and not allow_deleted:
+        if not _category_matches_reference(category, current_reference):
+            return None, "La categoría seleccionada está eliminada y no se puede asignar"
+
+    if not _category_is_active(category) and not allow_inactive:
+        if not _category_matches_reference(category, current_reference):
+            return None, "La categoría seleccionada está deshabilitada y no se puede asignar"
+
+    return category, None
+
+
 
 
 @projects_bp.route("/crear_proyecto", methods=["POST"])
@@ -165,21 +224,15 @@ def crear_proyecto(user):
     if departamento_id:
         data["departamento_id"] = departamento_id
     
-    # Process categoria: buscar por value y convertir a ObjectId
     if "categoria" in data and data["categoria"]:
-        categoria = None
-        # Intentar primero si es un ObjectId válido
-        try:
-            categoria_id = ObjectId(data["categoria"])
-            categoria = mongo.db.categorias.find_one({"_id": categoria_id})
-        except Exception:
-            # Si no es ObjectId, buscar por value (string como "recaudacion")
-            categoria = mongo.db.categorias.find_one({"value": data["categoria"]})
-        
-        if categoria:
-            data["categoria"] = categoria["_id"]
-        else:
-            return jsonify({"message": "Categoría no encontrada"}), 400
+        categoria, error = _resolve_category_reference(
+            data.get("categoria"),
+            allow_inactive=False,
+            allow_deleted=False,
+        )
+        if error:
+            return jsonify({"message": error}), 400
+        data["categoria"] = categoria["_id"]
     
     project = mongo.db.proyectos.insert_one(data)
 
@@ -219,14 +272,40 @@ def actualizar_proyecto(user, project_id):
         description: Proyecto no encontrado
     """
     data = _normalize_project_payload(request.get_json(silent=True) or {})
-    project = mongo.db.proyectos.find_one({"_id": ObjectId(project_id)})
+    try:
+        project_object_id = ObjectId(project_id)
+    except Exception:
+        return jsonify({"message": "ID de proyecto inválido"}), 400
+
+    project = mongo.db.proyectos.find_one({"_id": project_object_id})
     if not project:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    for key, value in data.items():
-        project[key] = value
+    update_fields = {}
+    if "categoria" in data:
+        categoria_value = data.get("categoria")
+        if categoria_value in (None, "", " "):
+            update_fields["categoria"] = None
+        else:
+            categoria, error = _resolve_category_reference(
+                categoria_value,
+                allow_inactive=False,
+                allow_deleted=False,
+                current_reference=project.get("categoria"),
+            )
+            if error:
+                return jsonify({"message": error}), 400
+            update_fields["categoria"] = categoria["_id"]
 
-    mongo.db.proyectos.update_one({"_id": ObjectId(project_id)}, {"$set": project})
+    for key, value in data.items():
+        if key == "categoria":
+            continue
+        update_fields[key] = value
+
+    if not update_fields:
+        return jsonify({"message": "No hay campos para actualizar"}), 400
+
+    mongo.db.proyectos.update_one({"_id": project_object_id}, {"$set": update_fields})
     message_log = "Usuario %s ha actualizado el proyecto" % user["nombre"]
     agregar_log(project_id, message_log)
 

@@ -296,13 +296,26 @@ def dashboard_global(user):
     ingresos = sum(a.get("amount", 0) for a in acciones if a.get("amount", 0) > 0) / 100
     egresos = abs(sum(a.get("amount", 0) for a in acciones if a.get("amount", 0) < 0)) / 100
 
-    # Categorias
-    categorias_map = {c["_id"]: c.get("label", "Sin Categoría") for c in mongo.db.categorias.find()}
+    # Categorias (compatibles con referencias por ObjectId o value legacy)
+    categorias_by_id = {}
+    categorias_by_value = {}
+    for category in mongo.db.categorias.find({}, {"_id": 1, "nombre": 1, "label": 1, "value": 1}):
+        label = category.get("nombre") or category.get("label") or "Sin Categoría"
+        categorias_by_id[str(category.get("_id"))] = label
+        if category.get("value"):
+            categorias_by_value[str(category.get("value"))] = label
+
     cat_counts = defaultdict(int)
     for p in projects:
         cat_id = p.get("categoria")
         if cat_id:
-            label = categorias_map.get(cat_id, "Desconocida")
+            if isinstance(cat_id, ObjectId):
+                cat_ref = str(cat_id)
+            elif isinstance(cat_id, dict) and "$oid" in cat_id:
+                cat_ref = str(cat_id.get("$oid"))
+            else:
+                cat_ref = str(cat_id)
+            label = categorias_by_id.get(cat_ref) or categorias_by_value.get(cat_ref) or "Desconocida"
             cat_counts[label] += 1
         else:
             cat_counts["Sin Categoría"] += 1
