@@ -893,16 +893,42 @@ def proyecto(user, id):
     if access_error:
         return access_error
 
-    proyecto = ProjectFundingService.decorate_project(proyecto, user=user)
-    proyecto["_id"] = str(proyecto["_id"])
-    proyecto["owner"] = str(proyecto["owner"])
-    if proyecto.get("departamento_id"):
-        proyecto["departamento_id"] = str(proyecto["departamento_id"])
-        proyecto["departmentId"] = proyecto["departamento_id"]
+    year_param = request.args.get("year")
+    if year_param:
+        try:
+            funding_year = int(year_param)
+        except Exception:
+            return jsonify({"message": "Año inválido"}), 400
+    else:
+        funding_year = datetime.now(timezone.utc).year
 
-    if "regla_fija" in proyecto:
-        proyecto["regla_fija"]["_id"] = str(proyecto["regla_fija"]["_id"])
-    return jsonify(proyecto)
+    proyecto = ProjectFundingService.decorate_project(proyecto, year=funding_year, user=user)
+    proyecto_dump = json_util.dumps(proyecto, default=json_util.default, ensure_ascii=False)
+    proyecto_json = json.loads(proyecto_dump)
+
+    project_id = proyecto_json.get("_id")
+    if isinstance(project_id, dict):
+        proyecto_json["_id"] = project_id.get("$oid")
+
+    owner_id = proyecto_json.get("owner")
+    if isinstance(owner_id, dict):
+        proyecto_json["owner"] = owner_id.get("$oid")
+
+    department_id = proyecto_json.get("departamento_id") or proyecto_json.get("departmentId")
+    if isinstance(department_id, dict):
+        department_id = department_id.get("$oid")
+    if department_id:
+        proyecto_json["departamento_id"] = department_id
+        proyecto_json["departmentId"] = department_id
+
+    if isinstance(proyecto_json.get("regla_fija"), dict):
+        rule_id = proyecto_json["regla_fija"].get("_id")
+        if isinstance(rule_id, dict):
+            proyecto_json["regla_fija"]["_id"] = rule_id.get("$oid")
+
+    proyecto_json["fundingYear"] = funding_year
+
+    return jsonify(proyecto_json)
 
 @projects_bp.route("/eliminar_proyecto", methods=["POST"])
 @allow_cors

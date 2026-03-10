@@ -97,11 +97,19 @@ def generar_reporte_proyecto(user, proyecto_id):
     if error_response:
         return error_response
     project_object_id = proyecto["_id"]
+    year_param = request.args.get("year")
+    if year_param:
+        try:
+            year = int(year_param)
+        except Exception:
+            return jsonify({"message": "Año inválido"}), 400
+    else:
+        year = datetime.now().year
 
     presupuestos = list(
         mongo.db.documentos.find({"$or": [{"project_id": project_object_id}, {"proyecto_id": project_object_id}]})
     )
-    report_payload = ProjectFundingService.report_payload(proyecto)
+    report_payload = ProjectFundingService.report_payload(proyecto, year=year)
     saldo_inicial = report_payload["saldo_inicial"]
     saldo_restante = report_payload["saldo_restante"]
 
@@ -204,10 +212,18 @@ def obtener_reporte_proyecto(user, id):
     if error_response:
         return error_response
     project_id = proyecto["_id"]
+    year_param = request.args.get("year")
+    if year_param:
+        try:
+            year = int(year_param)
+        except Exception:
+            return jsonify({"message": "Año inválido"}), 400
+    else:
+        year = datetime.now().year
 
     acciones = list(mongo.db.acciones.find({"project_id": project_id}).sort("created_at", 1))
 
-    report_payload = ProjectFundingService.report_payload(proyecto)
+    report_payload = ProjectFundingService.report_payload(proyecto, year=year)
     return jsonify({
         "balance_history": report_payload["balance_history"],
         "egresos_tipo": report_payload["egresos_tipo"],
