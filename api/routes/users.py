@@ -442,12 +442,44 @@ def mostrar_usuarios(user):
     list_cursor = list(list_users)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))
+
+    department_object_ids = []
     for item in list_json:
         dep_id = item.get("departamento_id")
         if isinstance(dep_id, dict):
             dep_id = dep_id.get("$oid")
             item["departamento_id"] = dep_id
+        elif isinstance(dep_id, ObjectId):
+            dep_id = str(dep_id)
+            item["departamento_id"] = dep_id
         if dep_id:
             item["departmentId"] = dep_id
+            if ObjectId.is_valid(dep_id):
+                department_object_ids.append(ObjectId(dep_id))
+
+    department_map = {}
+    if department_object_ids:
+        departamentos = mongo.db.departamentos.find(
+            {"_id": {"$in": list({dept_id for dept_id in department_object_ids})}},
+            {"codigo": 1, "nombre": 1},
+        )
+        department_map = {str(departamento["_id"]): departamento for departamento in departamentos}
+
+    for item in list_json:
+        dep_id = item.get("departmentId")
+        if not dep_id:
+            continue
+
+        department = department_map.get(str(dep_id))
+        if not department:
+            continue
+
+        item["departmentCode"] = department.get("codigo")
+        item["departmentName"] = department.get("nombre")
+        item["departamento"] = {
+            "_id": dep_id,
+            "codigo": department.get("codigo"),
+            "nombre": department.get("nombre"),
+        }
 
     return jsonify(request_list=list_json, count=quantity)
