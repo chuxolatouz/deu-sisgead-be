@@ -5,6 +5,12 @@ from datetime import datetime, timezone
 from api.extensions import mongo
 from api.util.decorators import token_required, allow_cors, validar_datos
 from api.services.project_funding_service import ProjectFundingService
+from api.util.access import (
+    can_access_department,
+    department_scope_filter,
+    is_super_admin,
+    parse_object_id,
+)
 
 departments_bp = Blueprint('departments', __name__)
 
@@ -14,17 +20,6 @@ def _serialize_cursor(cursor):
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     return json.loads(list_dump.replace("\\", ""))
 
-
-def _user_department_id(user):
-    dep = user.get("departmentId") or user.get("departamento_id")
-    return str(dep) if dep else None
-
-
-def _can_access_department(user, departamento_id):
-    if user.get("role") == "super_admin":
-        return True
-    user_dep = _user_department_id(user)
-    return bool(user_dep and user_dep == str(departamento_id))
 
 @departments_bp.route("/departamentos", methods=["POST"])
 @allow_cors
@@ -76,7 +71,10 @@ def crear_departamento(user):
       400:
         description: Datos inválidos
     """
-    data = request.get_json()
+    if not is_super_admin(user):
+        return jsonify({"message": "Solo super_admin puede crear departamentos"}), 403
+
+    data = request.get_json(silent=True) or {}
     departamento = {
         "nombre": data["nombre"],
         "descripcion": data["descripcion"],
@@ -89,7 +87,8 @@ def crear_departamento(user):
 
 @departments_bp.route("/departamentos", methods=["GET"])
 @allow_cors
-def listar_departamentos():
+@token_required
+def listar_departamentos(user):
     """
     Listar todos los departamentos
     ---
@@ -127,6 +126,10 @@ def listar_departamentos():
     query = {}
     if params.get("activo") is not None:
         query["activo"] = params.get("activo").lower() == "true"
+
+    scope_filter = department_scope_filter(user, field="_id")
+    if scope_filter:
+        query.update(scope_filter)
     
     has_pagination = params.get("page") is not None or params.get("limit") is not None
     if not has_pagination:
@@ -147,7 +150,8 @@ def listar_departamentos():
 
 @departments_bp.route("/departamentos/<string:departamento_id>", methods=["GET"])
 @allow_cors
-def obtener_departamento(departamento_id):
+@token_required
+def obtener_departamento(user, departamento_id):
     """
     Obtener departamento por ID
     ---
@@ -181,11 +185,13 @@ def obtener_departamento(departamento_id):
       404:
         description: Departamento no encontrado
     """
-    try:
-        departamento_id_obj = ObjectId(departamento_id.strip())
-    except Exception:
+    departamento_id_obj = parse_object_id(departamento_id)
+    if not departamento_id_obj:
         return jsonify({"message": "ID de departamento inválido"}), 400
-    
+
+    if not can_access_department(user, departamento_id_obj):
+        return jsonify({"message": "No autorizado para consultar este departamento"}), 403
+
     departamento = mongo.db.departamentos.find_one({"_id": departamento_id_obj})
     
     if not departamento:
@@ -232,8 +238,15 @@ def actualizar_departamento(user, departamento_id):
       404:
         description: Departamento no encontrado
     """
-    data = request.get_json()
-    departamento = mongo.db.departamentos.find_one({"_id": ObjectId(departamento_id)})
+    if not is_super_admin(user):
+        return jsonify({"message": "Solo super_admin puede actualizar departamentos"}), 403
+
+    departamento_object_id = parse_object_id(departamento_id)
+    if not departamento_object_id:
+        return jsonify({"message": "ID de departamento inválido"}), 400
+
+    data = request.get_json(silent=True) or {}
+    departamento = mongo.db.departamentos.find_one({"_id": departamento_object_id})
     if not departamento:
         return jsonify({"message": "Departamento no encontrado"}), 404
     
@@ -247,7 +260,7 @@ def actualizar_departamento(user, departamento_id):
     if "activo" in data:
         update_data["activo"] = data["activo"]
     
-    mongo.db.departamentos.update_one({"_id": ObjectId(departamento_id)}, {"$set": update_data})
+    mongo.db.departamentos.update_one({"_id": departamento_object_id}, {"$set": update_data})
     return jsonify({"message": "Departamento actualizado con éxito"}), 200
 
 @departments_bp.route("/departamentos/<string:departamento_id>", methods=["DELETE"])
@@ -274,11 +287,18 @@ def eliminar_departamento(user, departamento_id):
       400:
         description: No se pudo eliminar
     """
-    departamento = mongo.db.departamentos.find_one({"_id": ObjectId(departamento_id)})
+    if not is_super_admin(user):
+        return jsonify({"message": "Solo super_admin puede eliminar departamentos"}), 403
+
+    departamento_object_id = parse_object_id(departamento_id)
+    if not departamento_object_id:
+        return jsonify({"message": "ID de departamento inválido"}), 400
+
+    departamento = mongo.db.departamentos.find_one({"_id": departamento_object_id})
     if not departamento:
         return jsonify({"message": "Departamento no encontrado"}), 404
-    
-    result = mongo.db.departamentos.delete_one({"_id": ObjectId(departamento_id)})
+
+    result = mongo.db.departamentos.delete_one({"_id": departamento_object_id})
     if result.deleted_count == 1:
         return jsonify({"message": "Departamento eliminado con éxito"}), 200
     else:
@@ -289,12 +309,11 @@ def eliminar_departamento(user, departamento_id):
 @allow_cors
 @token_required
 def listar_proyectos_departamento(user, departamento_id):
-    if not _can_access_department(user, departamento_id):
+    if not can_access_department(user, departamento_id):
         return jsonify({"message": "No autorizado para consultar proyectos de este departamento"}), 403
 
-    try:
-        departamento_obj_id = ObjectId(departamento_id.strip())
-    except Exception:
+    departamento_obj_id = parse_object_id(departamento_id)
+    if not departamento_obj_id:
         return jsonify({"message": "ID de departamento inválido"}), 400
 
     page = int(request.args.get("page")) if request.args.get("page") else 0
@@ -324,12 +343,11 @@ def listar_proyectos_departamento(user, departamento_id):
 @allow_cors
 @token_required
 def listar_usuarios_departamento(user, departamento_id):
-    if not _can_access_department(user, departamento_id):
+    if not can_access_department(user, departamento_id):
         return jsonify({"message": "No autorizado para consultar usuarios de este departamento"}), 403
 
-    try:
-        departamento_obj_id = ObjectId(departamento_id.strip())
-    except Exception:
+    departamento_obj_id = parse_object_id(departamento_id)
+    if not departamento_obj_id:
         return jsonify({"message": "ID de departamento inválido"}), 400
 
     page = int(request.args.get("page")) if request.args.get("page") else 0
@@ -395,7 +413,7 @@ def obtener_contexto_departamento(user):
       403:
         description: Solo super_admin puede usar este endpoint
     """
-    if user.get("role") != "super_admin":
+    if not is_super_admin(user):
         return jsonify({"message": "Solo super_admin puede usar este endpoint"}), 403
     
     dept_context = request.headers.get("X-Department-Context")

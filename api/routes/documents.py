@@ -12,6 +12,7 @@ from api.util.common import agregar_log
 from api.util.utils import string_to_int, int_to_string
 from api.util.backblaze import upload_file
 from api.services.project_funding_service import ProjectFundingService
+from api.util.access import can_access_project, parse_object_id
 
 documents_bp = Blueprint('documents', __name__)
 
@@ -31,9 +32,20 @@ def _pick_json_value(data, *keys):
     return None
 
 
+def _forbidden(message="No autorizado"):
+    return jsonify({"message": message}), 403
+
+
+def _ensure_project_access(user, project):
+    if not can_access_project(user, project):
+        return _forbidden("No autorizado para acceder a este proyecto")
+    return None
+
+
 @documents_bp.route("/proyecto/<string:id>/documentos", methods=["GET"])
 @allow_cors
-def mostrar_documentos_proyecto(id):
+@token_required
+def mostrar_documentos_proyecto(user, id):
     """
     Listar actividades de un proyecto
     ---
@@ -76,13 +88,24 @@ def mostrar_documentos_proyecto(id):
             count:
               type: integer
     """
-    id = ObjectId(id)
+    project_object_id = parse_object_id(id)
+    if not project_object_id:
+        return jsonify({"message": "ID de proyecto inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id}, {"departamento_id": 1})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
     skip = page * limit  # Calcular skip basado en page y limit
-    documentos = mongo.db.documentos.find({"project_id": id}).skip(skip).limit(limit)
-    total_items = mongo.db.documentos.count_documents({"project_id": id})
+    documentos = mongo.db.documentos.find({"project_id": project_object_id}).skip(skip).limit(limit)
+    total_items = mongo.db.documentos.count_documents({"project_id": project_object_id})
     quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(documentos)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
@@ -156,11 +179,23 @@ def crear_presupuesto(user):
 
     if not project_id or not descripcion or not monto:
         return jsonify({"error": "Missing required fields"}), 400
+
+    project_object_id = parse_object_id(project_id)
+    if not project_object_id:
+        return jsonify({"error": "projectId inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id}, {"departamento_id": 1})
+    if not proyecto:
+        return jsonify({"error": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
         
     presupuesto_id = str(ObjectId())
 
     presupuesto = {
-        "project_id": ObjectId(project_id),
+        "project_id": project_object_id,
         "presupuesto_id": presupuesto_id,
         "descripcion": descripcion,
         "monto": string_to_int(monto),
@@ -270,12 +305,33 @@ def cerrar_presupuesto(user):
     if not cuenta_contable:
         return jsonify({"error": "accountCode es requerido"}), 400
 
+    project_object_id = parse_object_id(id)
+    if not project_object_id:
+        return jsonify({"error": "projectId inválido"}), 400
+
+    documento_object_id = parse_object_id(doc_id)
+    if not documento_object_id:
+        return jsonify({"error": "docId inválido"}), 400
+
     if not os.path.exists(carpeta_proyecto):
         os.makedirs(carpeta_proyecto)
         
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(id)})
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
     if not proyecto:
         return jsonify({"error": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
+    documento = mongo.db.documentos.find_one({"_id": documento_object_id})
+    if not documento:
+        return jsonify({"error": "Actividad no encontrada"}), 404
+
+    documento_project_id = parse_object_id(documento.get("project_id") or documento.get("proyecto_id"))
+    if not documento_project_id or str(documento_project_id) != str(project_object_id):
+        return jsonify({"error": "La actividad no pertenece al proyecto indicado"}), 400
+
     data_balance_int = string_to_int(data_balance)
     amount_units = round(data_balance_int / 100, 2)
 
@@ -326,7 +382,7 @@ def cerrar_presupuesto(user):
         )
 
     mongo.db.documentos.update_one(
-        {"_id": ObjectId(doc_id)},
+        {"_id": documento_object_id},
         {
             "$set": {
                 "status": "finished",
@@ -386,17 +442,33 @@ def eliminar_presupuesto_route(user):
     if not presupuesto_id:
         return jsonify({"message": "budgetId es requerido"}), 400
 
-    documento = mongo.db.documentos.find_one({"_id": ObjectId(presupuesto_id)})
+    presupuesto_object_id = parse_object_id(presupuesto_id)
+    if not presupuesto_object_id:
+        return jsonify({"message": "budgetId inválido"}), 400
+
+    documento = mongo.db.documentos.find_one({"_id": presupuesto_object_id})
     if documento is None:
         return jsonify({"message": "Actividad no encontrada"}), 404
+
+    documento_project_id = parse_object_id(documento.get("project_id") or documento.get("proyecto_id") or project_id)
+    if not documento_project_id:
+        return jsonify({"message": "La actividad no está asociada a un proyecto válido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": documento_project_id}, {"departamento_id": 1})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
 
     if documento["status"] == "finished":
         return jsonify({"mensaje": "Actividad esta finalizada, no se puede eliminar"}), 401
     
-    result = mongo.db.documentos.delete_one({"_id": ObjectId(presupuesto_id)})
+    result = mongo.db.documentos.delete_one({"_id": presupuesto_object_id})
     if result.deleted_count == 1:
         message_log = f'{user["nombre"]} elimino la actividad {documento["descripcion"]} con un monto de Bs. {int_to_string(documento["monto"])}'
-        agregar_log(project_id, message_log) # project_id passed in body
+        agregar_log(documento_project_id, message_log)
         return jsonify({"message": "Actividad eliminada con éxito"}), 200
     else:
         return jsonify({"message": "No se pudo eliminar"}), 400

@@ -12,6 +12,14 @@ from api.util.utils import string_to_int, int_to_string, int_to_float, actualiza
 from api.util.generar_acta_finalizacion import generar_acta_finalizacion_pdf
 from api.util.backblaze import upload_file
 from api.services.project_funding_service import ProjectFundingService
+from api.util.access import (
+    can_access_project,
+    is_super_admin,
+    parse_object_id,
+    user_department_id,
+    user_role,
+    ROLE_SUPER_ADMIN,
+)
 
 projects_bp = Blueprint('projects', __name__)
 PLACEHOLDER = "(POR DEFINIR)"
@@ -27,6 +35,42 @@ def _pick_value(data, *keys):
         if key in data and data.get(key) not in (None, ""):
             return data.get(key)
     return None
+
+
+def _forbidden(message="No autorizado"):
+    return jsonify({"message": message}), 403
+
+
+def _ensure_project_access(user, project):
+    if not can_access_project(user, project):
+        return _forbidden("No autorizado para acceder a este proyecto")
+    return None
+
+
+def _extract_payload_user_id(payload_user):
+    if not isinstance(payload_user, dict):
+        return None
+
+    value = payload_user.get("_id")
+    if isinstance(value, dict):
+        value = value.get("$oid")
+    if value in (None, ""):
+        return None
+    return str(value)
+
+
+def _extract_member_user_id(member):
+    if not isinstance(member, dict):
+        return None
+    payload_user = member.get("usuario") or {}
+    if not isinstance(payload_user, dict):
+        return None
+    value = payload_user.get("_id")
+    if isinstance(value, dict):
+        value = value.get("$oid")
+    if value in (None, ""):
+        return None
+    return str(value)
 
 
 def _normalize_project_payload(data):
@@ -47,9 +91,8 @@ def _normalize_project_payload(data):
 
 
 def _get_project_or_404(project_id):
-    try:
-        object_id = ObjectId(project_id.strip())
-    except Exception:
+    object_id = parse_object_id(project_id)
+    if not object_id:
         return None, (jsonify({"message": "ID de proyecto inválido"}), 400)
 
     project = mongo.db.proyectos.find_one({"_id": object_id})
@@ -188,25 +231,25 @@ def crear_proyecto(user):
     
     departamento_id = None
     payload_department_id = _pick_value(data, "departmentId", "department_id", "departamento_id")
-    if payload_department_id:
-        try:
-            dept_id_obj = ObjectId(str(payload_department_id))
+    if not is_super_admin(user):
+        actor_department_id = user_department_id(user)
+        actor_department_object_id = parse_object_id(actor_department_id)
+        if not actor_department_object_id:
+            return _forbidden("El usuario no tiene un departamento válido asociado")
+        if payload_department_id and str(payload_department_id).strip() != str(actor_department_object_id):
+            return _forbidden("Solo puedes crear proyectos en tu departamento")
+        departamento_id = actor_department_object_id
+    else:
+        if payload_department_id:
+            dept_id_obj = parse_object_id(payload_department_id)
+            if not dept_id_obj:
+                return jsonify({"message": "ID de departamento inválido"}), 400
             departamento = mongo.db.departamentos.find_one({"_id": dept_id_obj})
             if not departamento:
                 return jsonify({"message": "Departamento no encontrado"}), 400
             departamento_id = dept_id_obj
-        except Exception:
-            return jsonify({"message": "ID de departamento inválido"}), 400
-    elif user.get("_using_dept_context") and ("departamento_id" in user or "departmentId" in user):
-        try:
-            departamento_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
-        except Exception:
-            pass
-    elif user.get("role") == "admin_departamento" and ("departamento_id" in user or "departmentId" in user):
-        try:
-            departamento_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
-        except Exception:
-            pass
+        elif user.get("_using_dept_context") and ("departamento_id" in user or "departmentId" in user):
+            departamento_id = parse_object_id(user.get("departmentId") or user.get("departamento_id"))
     
     data["miembros"] = []
     data["balance"] = 0
@@ -281,6 +324,27 @@ def actualizar_proyecto(user, project_id):
     if not project:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
+    access_error = _ensure_project_access(user, project)
+    if access_error:
+        return access_error
+
+    if "departamento_id" in data:
+        if not is_super_admin(user):
+            actor_department_object_id = parse_object_id(user_department_id(user))
+            requested_department_object_id = parse_object_id(data.get("departamento_id"))
+            if requested_department_object_id and actor_department_object_id and str(requested_department_object_id) != str(actor_department_object_id):
+                return _forbidden("No puedes mover proyectos a otro departamento")
+            data["departamento_id"] = actor_department_object_id
+        else:
+            department_object_id = parse_object_id(data.get("departamento_id"))
+            if data.get("departamento_id") not in (None, "") and not department_object_id:
+                return jsonify({"message": "ID de departamento inválido"}), 400
+            if department_object_id:
+                department = mongo.db.departamentos.find_one({"_id": department_object_id})
+                if not department:
+                    return jsonify({"message": "Departamento no encontrado"}), 400
+                data["departamento_id"] = department_object_id
+
     update_fields = {}
     if "categoria" in data:
         categoria_value = data.get("categoria")
@@ -350,22 +414,52 @@ def asignar_usuario_proyecto(user):
       400:
         description: Usuario ya es miembro
     """
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
     usuario = _pick_value(data, "user", "usuario")
     if not proyecto_id or not usuario or "role" not in data:
         return jsonify({"message": "projectId, user y role son requeridos"}), 400
+
+    project_object_id = parse_object_id(proyecto_id)
+    if not project_object_id:
+        return jsonify({"message": "projectId inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
+    target_user_id = _extract_payload_user_id(usuario)
+    if not target_user_id:
+        return jsonify({"message": "El campo user debe incluir un _id válido"}), 400
+
+    target_user_object_id = parse_object_id(target_user_id)
+    if not target_user_object_id:
+        return jsonify({"message": "ID de usuario inválido"}), 400
+
+    target_user = mongo.db.usuarios.find_one({"_id": target_user_object_id})
+    if not target_user:
+        return jsonify({"message": "Usuario no encontrado"}), 404
+
+    project_department_id = parse_object_id(proyecto.get("departamento_id"))
+    target_user_department = parse_object_id(target_user.get("departamento_id") or target_user.get("departmentId"))
+    target_user_role = (target_user.get("rol") or "usuario").strip()
+    if project_department_id and target_user_role != ROLE_SUPER_ADMIN:
+        if not target_user_department or str(target_user_department) != str(project_department_id):
+            return jsonify({"message": "El usuario solo puede ser asignado a proyectos de su departamento"}), 400
+
     fecha_hora_actual = datetime.now(timezone.utc)
     member_payload = {
         "usuario": usuario,
         "role": data["role"],
         "fecha_ingreso": fecha_hora_actual.strftime("%d/%m/%Y %H:%M")
     }
-    
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
-    miembros = proyecto["miembros"]
 
-    if any(miembro["usuario"]["_id"]["$oid"] == usuario["_id"]["$oid"] for miembro in miembros):
+    miembros = proyecto.get("miembros", [])
+    if any(_extract_member_user_id(miembro) == target_user_id for miembro in miembros):
         return jsonify({"message": "El usuario ya es miembro del proyecto"}), 400
 
     new_status = {}
@@ -380,7 +474,7 @@ def asignar_usuario_proyecto(user):
     if bool(new_status):
         query["$set"] = {"status": new_status}
 
-    mongo.db.proyectos.update_one({"_id": ObjectId(proyecto_id)}, query)
+    mongo.db.proyectos.update_one({"_id": project_object_id}, query)
     message_log = f'{usuario["nombre"]} fue asignado al proyecto por {user["nombre"]} con el rol {data["role"]["label"]}'
     agregar_log(proyecto_id, message_log)
     return jsonify({"message": "Usuario asignado al proyecto con éxito"}), 200
@@ -416,23 +510,34 @@ def eliminar_usuario_proyecto(user):
       400:
         description: Usuario no es miembro
     """
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
     usuario_id = _pick_value(data, "userId", "usuario_id", "user_id")
     if not proyecto_id or not usuario_id:
         return jsonify({"message": "projectId y userId son requeridos"}), 400
 
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
+    project_object_id = parse_object_id(proyecto_id)
+    if not project_object_id:
+        return jsonify({"message": "projectId inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     usuario = None
-    for miembro in proyecto["miembros"]:
-        if miembro["usuario"]["_id"]["$oid"] == usuario_id:
+    for miembro in proyecto.get("miembros", []):
+        if _extract_member_user_id(miembro) == str(usuario_id):
             usuario = miembro["usuario"]
             break
     if usuario is None:
         return jsonify({"message": "El usuario no es miembro del proyecto"}), 400
 
     mongo.db.proyectos.update_one(
-        {"_id": ObjectId(proyecto_id)},
+        {"_id": project_object_id},
         {"$pull": {"miembros": {"usuario._id.$oid": usuario_id}}},
     )
     message_log = f'{usuario["nombre"]} fue eliminado del proyecto por {user["nombre"]}'
@@ -468,17 +573,26 @@ def asignar_regla_distribucion(user):
       200:
         description: Regla establecida
     """
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
     regla_distribucion = _pick_value(data, "distributionRule", "regla_distribucion")
     if not proyecto_id or not isinstance(regla_distribucion, dict):
         return jsonify({"message": "projectId y distributionRule son requeridos"}), 400
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
+    project_object_id = parse_object_id(proyecto_id)
+    if not project_object_id:
+        return jsonify({"message": "projectId inválido"}), 400
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
 
     if 4 not in proyecto["status"]["completado"]:
         new_status, _ = actualizar_pasos(proyecto["status"], 4)
         mongo.db.proyectos.update_one(
-            {"_id": ObjectId(proyecto_id)},
+            {"_id": project_object_id},
             {"$set": {"status": new_status, "reglas": regla_distribucion}},
         )
 
@@ -523,14 +637,18 @@ def asignar_balance(user):
     if not proyecto_id:
         return jsonify({"message": "projectId es requerido"}), 400
 
-    try:
-        proyecto_object_id = ObjectId(str(proyecto_id))
-    except Exception:
+    proyecto_object_id = parse_object_id(proyecto_id)
+    if not proyecto_object_id:
         return jsonify({"message": "projectId inválido"}), 400
 
     proyecto = mongo.db.proyectos.find_one({"_id": proyecto_object_id})
     if not proyecto:
         return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     if "balance" not in data:
         return jsonify({"message": "balance es requerido"}), 400
 
@@ -608,40 +726,15 @@ def mostrar_proyectos(user):
     limit = int(params.get("limit")) if params.get("limit") else 10
     skip = page * limit  # Calcular skip basado en page y limit
     
-    query = {
-        "$or": [
-            {"owner": user["sub"]},
-            {"miembros": {"$elemMatch": {"usuario._id.$oid": user["sub"]}}},
-        ]
-    }
-    
-    if user.get("role") == "super_admin":
-        if user.get("_using_dept_context") and ("departamento_id" in user or "departmentId" in user):
-            try:
-                dept_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
-                query = {
-                    "$or": [
-                        {"departamento_id": dept_id},
-                        {"owner": user["sub"]},
-                        {"miembros": {"$elemMatch": {"usuario._id.$oid": user["sub"]}}},
-                    ]
-                }
-            except Exception:
-                query = {}
+    if is_super_admin(user):
+        if user.get("_using_dept_context"):
+            department_object_id = parse_object_id(user_department_id(user))
+            query = {"departamento_id": department_object_id} if department_object_id else {"_id": {"$exists": False}}
         else:
-            query = {} 
-    elif user.get("role") == "admin_departamento" and ("departamento_id" in user or "departmentId" in user):
-        try:
-            dept_id = ObjectId(user.get("departmentId") or user.get("departamento_id"))
-            query = {
-                "$or": [
-                    {"departamento_id": dept_id},
-                    {"owner": user["sub"]},
-                    {"miembros": {"$elemMatch": {"usuario._id.$oid": user["sub"]}}},
-                ]
-            }
-        except Exception:
-            pass
+            query = {}
+    else:
+        department_object_id = parse_object_id(user_department_id(user))
+        query = {"departamento_id": department_object_id} if department_object_id else {"_id": {"$exists": False}}
 
     projection = {"miembros.usuario.password": 0}
 
@@ -661,7 +754,7 @@ def mostrar_proyectos(user):
 
 @projects_bp.route('/proyecto/<string:proyecto_id>/objetivos', methods=['GET'])
 @token_required
-def obtener_objetivos_especificos(_, proyecto_id):
+def obtener_objetivos_especificos(user, proyecto_id):
     """
     Obtener objetivos específicos del proyecto
     ---
@@ -688,14 +781,24 @@ def obtener_objetivos_especificos(_, proyecto_id):
       404:
         description: Proyecto no encontrado
     """
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)}, {"objetivos_especificos": 1})
+    project_object_id = parse_object_id(proyecto_id)
+    if not project_object_id:
+        return jsonify({"message": "ID de proyecto inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id}, {"objetivos_especificos": 1, "departamento_id": 1})
     if not proyecto:
         return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     return jsonify({"objetivos_especificos": proyecto.get("objetivos_especificos", [])})
 
 @projects_bp.route("/proyecto/<string:id>/acciones", methods=["GET"])
 @allow_cors
-def acciones_proyecto(id):
+@token_required
+def acciones_proyecto(user, id):
     """
     Listar acciones/movimientos del proyecto
     ---
@@ -728,14 +831,25 @@ def acciones_proyecto(id):
             count:
               type: integer
     """
-    id = ObjectId(id)
+    project_object_id = parse_object_id(id)
+    if not project_object_id:
+        return jsonify({"message": "ID de proyecto inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id}, {"departamento_id": 1})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
     skip = page * limit  # Calcular skip basado en page y limit
-    acciones = mongo.db.acciones.find({"project_id": id}).skip(skip).limit(limit)
+    acciones = mongo.db.acciones.find({"project_id": project_object_id}).skip(skip).limit(limit)
     acciones = map(map_to_doc, acciones)
-    total_items = mongo.db.acciones.count_documents({"project_id": id})
+    total_items = mongo.db.acciones.count_documents({"project_id": project_object_id})
     quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(acciones)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
@@ -767,14 +881,17 @@ def proyecto(user, id):
       404:
         description: Proyecto no encontrado
     """
-    try:
-        id = ObjectId(id.strip())
-    except Exception:
+    project_object_id = parse_object_id(id.strip())
+    if not project_object_id:
         return {"message": "ID de proyecto inválido"}, 400
 
-    proyecto = mongo.db.proyectos.find_one({"_id": id})
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
     if not proyecto:
         return jsonify({"error": "proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
 
     proyecto = ProjectFundingService.decorate_project(proyecto, user=user)
     proyecto["_id"] = str(proyecto["_id"])
@@ -819,11 +936,19 @@ def eliminar_proyecto(user):
     id = _pick_value(data, "projectId", "project_id", "proyecto_id")
     if not id:
         return jsonify({"message": "projectId es requerido"}), 400
-    documento = mongo.db.proyectos.find_one({"_id": ObjectId(id)})
+    project_object_id = parse_object_id(id)
+    if not project_object_id:
+        return jsonify({"message": "projectId inválido"}), 400
+
+    documento = mongo.db.proyectos.find_one({"_id": project_object_id})
     if documento is None:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    result = mongo.db.proyectos.delete_one({"_id": ObjectId(id)})
+    access_error = _ensure_project_access(user, documento)
+    if access_error:
+        return access_error
+
+    result = mongo.db.proyectos.delete_one({"_id": project_object_id})
     if result.deleted_count == 1:
         return jsonify({"message": "Proyecto eliminado con éxito"}), 200
     else:
@@ -861,11 +986,18 @@ def finalizar_proyecto(user):
     proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
     if not proyecto_id:
         return jsonify({"message": "projectId es requerido"}), 400
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
+    project_object_id = parse_object_id(proyecto_id)
+    if not project_object_id:
+        return jsonify({"message": "projectId inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
     if not proyecto:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    project_object_id = ObjectId(proyecto_id)
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     movimientos = ProjectFundingService.build_timeline(proyecto)
     movimientos_simple = [{"type": m.get("title"), "amount": m.get("amount", 0), "user": m.get("actorName", "N/A")} for m in movimientos]
 
@@ -876,11 +1008,11 @@ def finalizar_proyecto(user):
     presupuestos_simple = [{"descripcion": b.get("descripcion", ""), "monto_aprobado": b.get("monto_aprobado", 0)} for b in presupuestos]
 
     mongo.db.proyectos.update_one(
-        {"_id": ObjectId(proyecto_id)},
+        {"_id": project_object_id},
         {"$set": {"status.finished": True, "fecha_fin": datetime.utcnow()}}
     )
 
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
     proyecto = ProjectFundingService.decorate_project(proyecto)
     
     try:
@@ -894,7 +1026,7 @@ def finalizar_proyecto(user):
         upload_result = upload_file(BytesIO(pdf_bytes), file_name)
         
         mongo.db.proyectos.update_one(
-            {"_id": ObjectId(proyecto['_id'])},
+            {"_id": project_object_id},
             {"$set": {"acta_finalizacion": {"fecha": datetime.utcnow(), "documento_url": upload_result["download_url"], "file_id": upload_result["fileId"]}}}
         )
     except Exception as e:
@@ -904,7 +1036,8 @@ def finalizar_proyecto(user):
 
 @projects_bp.route("/proyecto/<string:id>/logs", methods=["GET"])
 @allow_cors
-def obtener_logs(id):
+@token_required
+def obtener_logs(user, id):
     """
     Listar logs de auditoría del proyecto
     ---
@@ -934,13 +1067,24 @@ def obtener_logs(id):
             count:
               type: integer
     """
-    id = ObjectId(id)
+    project_object_id = parse_object_id(id)
+    if not project_object_id:
+        return jsonify({"message": "ID de proyecto inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id}, {"departamento_id": 1})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
     skip = page * limit  # Calcular skip basado en page y limit
-    acciones = mongo.db.logs.find({"id_proyecto": id}).skip(skip).limit(limit)
-    total_items = mongo.db.logs.count_documents({"id_proyecto": id})
+    acciones = mongo.db.logs.find({"id_proyecto": project_object_id}).skip(skip).limit(limit)
+    total_items = mongo.db.logs.count_documents({"id_proyecto": project_object_id})
     quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(acciones)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
@@ -949,7 +1093,8 @@ def obtener_logs(id):
 
 @projects_bp.route("/proyecto/<string:id>/movimientos/descargar", methods=["GET"])
 @allow_cors
-def descargar_movimientos(id):
+@token_required
+def descargar_movimientos(user, id):
     """
     Descargar movimientos del proyecto
     ---
@@ -971,10 +1116,18 @@ def descargar_movimientos(id):
       400:
         description: Formato no válido
     """
-    id_proyecto = ObjectId(id)
+    id_proyecto = parse_object_id(id)
+    if not id_proyecto:
+        return jsonify({"message": "ID de proyecto inválido"}), 400
+
     proyecto = mongo.db.proyectos.find_one({"_id": id_proyecto})
     if not proyecto:
         return jsonify({"error": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     movimientos_lista = ProjectFundingService.build_timeline(proyecto)
     formato = request.args.get("formato", "csv").lower()
 
@@ -987,7 +1140,8 @@ def descargar_movimientos(id):
 
 @projects_bp.route("/proyecto/<string:id>/fin", methods=["GET"])
 @allow_cors
-def mostrar_finalizacion(id):
+@token_required
+def mostrar_finalizacion(user, id):
     """
     Obtener datos para el acta de finalización
     ---
@@ -1011,14 +1165,21 @@ def mostrar_finalizacion(id):
             movimientos:
               type: array
     """
-    id = ObjectId(id)
-    proyecto = mongo.db.proyectos.find_one({"_id": id})
+    project_object_id = parse_object_id(id)
+    if not project_object_id:
+        return jsonify({"message": "ID de proyecto inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
     if not proyecto:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
     movs = ProjectFundingService.build_timeline(proyecto)
-    docs = mongo.db.documentos.find({"project_id": id})
-    logs = mongo.db.logs.find({"id_proyecto": id})
+    docs = mongo.db.documentos.find({"project_id": project_object_id})
+    logs = mongo.db.logs.find({"id_proyecto": project_object_id})
 
     movs_json = json.loads(json_util.dumps(list(movs)).replace("\\", ""))
     docs_json = json.loads(json_util.dumps(list(docs)).replace("\\", ""))

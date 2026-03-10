@@ -1,21 +1,43 @@
 from flask import Blueprint, request, jsonify
 from bson import ObjectId, json_util
 import json
-from api.extensions import mongo
+from api.extensions import mongo, bcrypt
 from api.util.decorators import token_required, allow_cors, validar_datos
+from api.util.access import (
+    ROLE_ADMIN_DEPARTAMENTO,
+    ROLE_SUPER_ADMIN,
+    ROLE_USUARIO,
+    VALID_ROLES,
+    department_scope_filter,
+    ensure_role_department_policy,
+    is_admin_departamento,
+    is_super_admin,
+    normalize_role,
+    parse_object_id,
+    pick_value,
+    user_department_id,
+    user_role,
+)
 
 users_bp = Blueprint('users', __name__)
 
 
-def _pick_value(data, *keys):
-    for key in keys:
-        if key in data and data.get(key) not in (None, ""):
-            return data.get(key)
-    return None
+def _forbidden(message="No autorizado"):
+    return jsonify({"message": message}), 403
+
+
+def _get_user_or_404(user_id):
+    object_id = parse_object_id(user_id)
+    if not object_id:
+        return None, (jsonify({"message": "ID de usuario inválido"}), 400)
+    user = mongo.db.usuarios.find_one({"_id": object_id})
+    if not user:
+        return None, (jsonify({"message": "Usuario no encontrado"}), 404)
+    return user, None
 
 @users_bp.route("/editar_usuario/<id_usuario>", methods=["PUT"])
 @token_required
-def editar_usuario(id_usuario):
+def editar_usuario(actor, id_usuario):
     """
     Editar información de usuario
     ---
@@ -41,8 +63,66 @@ def editar_usuario(id_usuario):
       200:
         description: Usuario actualizado
     """
-    data = request.get_json()
-    mongo.db.usuarios.update_one({"_id": ObjectId(id_usuario)}, {"$set": data})
+    actor_role = user_role(actor)
+    if actor_role not in {ROLE_SUPER_ADMIN, ROLE_ADMIN_DEPARTAMENTO}:
+        return _forbidden("No autorizado para editar usuarios")
+
+    usuario, error_response = _get_user_or_404(id_usuario)
+    if error_response:
+        return error_response
+
+    actor_department_id = user_department_id(actor)
+    target_department_id = user_department_id(usuario)
+    if is_admin_departamento(actor):
+        if not actor_department_id:
+            return _forbidden("admin_departamento no tiene departamento asociado")
+        if actor_department_id != target_department_id:
+            return _forbidden("Solo puedes editar usuarios de tu departamento")
+
+    data = request.get_json(silent=True) or {}
+    update_data = {}
+
+    if "nombre" in data:
+        update_data["nombre"] = data.get("nombre")
+    if "email" in data:
+        update_data["email"] = data.get("email")
+    if "password" in data and data.get("password"):
+        update_data["password"] = bcrypt.generate_password_hash(data.get("password")).decode('utf-8')
+
+    has_department_change = ("departmentId" in data) or ("departamento_id" in data) or ("department_id" in data)
+    if has_department_change:
+        if "departmentId" in data:
+            department_payload_value = data.get("departmentId")
+        elif "departamento_id" in data:
+            department_payload_value = data.get("departamento_id")
+        else:
+            department_payload_value = data.get("department_id")
+        department_object_id, department_error = ensure_role_department_policy(
+            usuario.get("rol") or ROLE_USUARIO,
+            department_payload_value,
+        )
+        if department_error:
+            return jsonify({"message": department_error}), 400
+
+        if is_admin_departamento(actor):
+            if not department_object_id or str(department_object_id) != actor_department_id:
+                return _forbidden("Solo puedes mantener usuarios en tu departamento")
+
+        update_data["departamento_id"] = department_object_id
+
+    if not update_data:
+        return jsonify({"message": "No hay campos válidos para actualizar"}), 400
+
+    if "departamento_id" not in update_data:
+        resolved_department = parse_object_id(usuario.get("departamento_id") or usuario.get("departmentId"))
+    else:
+        resolved_department = update_data.get("departamento_id")
+
+    target_role = usuario.get("rol") or ROLE_USUARIO
+    if target_role != ROLE_SUPER_ADMIN and not resolved_department:
+        return jsonify({"message": "El usuario debe tener un departamento asociado"}), 400
+
+    mongo.db.usuarios.update_one({"_id": usuario["_id"]}, {"$set": update_data})
     return jsonify({"message": "Información de usuario actualizada con éxito"}), 200
 
 @users_bp.route("/eliminar_usuario", methods=["POST"])
@@ -73,11 +153,31 @@ def eliminar_usuario(user):
       400:
         description: No se pudo eliminar
     """
+    actor_role = user_role(user)
+    if actor_role not in {ROLE_SUPER_ADMIN, ROLE_ADMIN_DEPARTAMENTO}:
+        return _forbidden("No autorizado para eliminar usuarios")
+
     data = request.get_json(silent=True) or {}
-    id_usuario = _pick_value(data, "idUsuario", "id_usuario", "userId")
+    id_usuario = pick_value(data, "idUsuario", "id_usuario", "userId")
     if not id_usuario:
         return jsonify({"message": "idUsuario es requerido"}), 400
-    result = mongo.db.usuarios.delete_one({"_id": ObjectId(id_usuario)})
+
+    usuario, error_response = _get_user_or_404(id_usuario)
+    if error_response:
+        return error_response
+
+    if str(usuario.get("_id")) == str(user.get("sub")):
+        return jsonify({"message": "No puedes eliminar tu propio usuario"}), 400
+
+    if is_admin_departamento(user):
+        actor_department_id = user_department_id(user)
+        target_department_id = user_department_id(usuario)
+        if not actor_department_id or actor_department_id != target_department_id:
+            return _forbidden("Solo puedes eliminar usuarios de tu departamento")
+        if (usuario.get("rol") or ROLE_USUARIO) != ROLE_USUARIO:
+            return _forbidden("admin_departamento solo puede eliminar usuarios con rol usuario")
+
+    result = mongo.db.usuarios.delete_one({"_id": usuario["_id"]})
 
     if result.deleted_count == 1:
         return jsonify({"message": "Usuario eliminado éxitosamente"}), 200
@@ -113,7 +213,7 @@ def roles():
 
 @users_bp.route("/crear_rol", methods=["POST"])
 @token_required
-def crear_rol():
+def crear_rol(user):
     """
     Crear nuevo rol
     ---
@@ -133,13 +233,16 @@ def crear_rol():
       201:
         description: Rol creado
     """
-    data = request.get_json()
+    if not is_super_admin(user):
+        return _forbidden("Solo super_admin puede crear roles")
+
+    data = request.get_json(silent=True) or {}
     mongo.db.roles.insert_one(data)
     return jsonify({"message": "Rol creado con éxito"}), 201
 
 @users_bp.route("/asignar_rol", methods=["PATCH"])
 @token_required
-def asignar_rol():
+def asignar_rol(user):
     """
     Asignar rol a usuario
     ---
@@ -165,9 +268,12 @@ def asignar_rol():
       200:
         description: Rol asignado
     """
+    if not is_super_admin(user):
+        return _forbidden("Solo super_admin puede asignar roles")
+
     data = request.get_json(silent=True) or {}
-    user_id = _pick_value(data, "userId", "user_id")
-    rol_id = _pick_value(data, "roleId", "rol_id")
+    user_id = pick_value(data, "userId", "user_id")
+    rol_id = pick_value(data, "roleId", "rol_id")
     if not user_id or not rol_id:
         return jsonify({"message": "userId y roleId son requeridos"}), 400
     mongo.db.usuarios.update_one(
@@ -214,42 +320,53 @@ def cambiar_rol_usuario(user):
       404:
         description: Usuario no encontrado
     """
+    actor_role = user_role(user)
+    if actor_role not in {ROLE_SUPER_ADMIN, ROLE_ADMIN_DEPARTAMENTO}:
+        return _forbidden("No autorizado para cambiar roles")
+
     data = request.get_json(silent=True) or {}
-    usuario_id = _pick_value(data, "id", "userId")
-    nuevo_rol = _pick_value(data, "rol", "role")
-    departamento_id = _pick_value(data, "departmentId", "departamento_id")
+    usuario_id = pick_value(data, "id", "userId")
+    nuevo_rol = normalize_role(pick_value(data, "rol", "role"))
+    departamento_id = pick_value(data, "departmentId", "departamento_id", "department_id")
 
-    roles_permitidos = ["usuario", "admin_departamento", "super_admin"]
-    if nuevo_rol not in roles_permitidos:
-        return jsonify({"message": f"Rol inválido. Debe ser uno de: {', '.join(roles_permitidos)}"}), 400
+    if nuevo_rol not in VALID_ROLES:
+        return jsonify({"message": f"Rol inválido. Debe ser uno de: {', '.join(VALID_ROLES)}"}), 400
 
-    usuario = mongo.db.usuarios.find_one({"_id": ObjectId(usuario_id)})
-    if not usuario:
-        return jsonify({"message": "Usuario no encontrado"}), 404
+    usuario, error_response = _get_user_or_404(usuario_id)
+    if error_response:
+        return error_response
+
+    if is_admin_departamento(user):
+        actor_department_id = user_department_id(user)
+        target_department_id = user_department_id(usuario)
+        if not actor_department_id:
+            return _forbidden("admin_departamento no tiene departamento asociado")
+        if actor_department_id != target_department_id:
+            return _forbidden("Solo puedes cambiar roles de usuarios en tu departamento")
+        if nuevo_rol != ROLE_USUARIO:
+            return _forbidden("admin_departamento solo puede asignar el rol usuario")
+        departamento_object_id, department_error = ensure_role_department_policy(nuevo_rol, actor_department_id)
+        if department_error:
+            return jsonify({"message": "admin_departamento no tiene un departamento válido asociado"}), 403
+    else:
+        departamento_object_id, department_error = ensure_role_department_policy(nuevo_rol, departamento_id)
+        if department_error:
+            return jsonify({"message": department_error}), 400
 
     update_data = {"rol": nuevo_rol}
-    
-    if departamento_id:
-        try:
-            departamento = mongo.db.departamentos.find_one({"_id": ObjectId(departamento_id)})
-            if not departamento:
-                return jsonify({"message": "Departamento no encontrado"}), 400
-            update_data["departamento_id"] = ObjectId(departamento_id)
-        except Exception:
-            return jsonify({"message": "ID de departamento inválido"}), 400
-    elif ("departamento_id" in data and data["departamento_id"] is None) or ("departmentId" in data and data["departmentId"] is None):
+    if departamento_object_id:
+        update_data["departamento_id"] = departamento_object_id
+    elif nuevo_rol == ROLE_SUPER_ADMIN:
         update_data["departamento_id"] = None
 
-    mongo.db.usuarios.update_one(
-        {"_id": ObjectId(usuario_id)},
-        {"$set": update_data}
-    )
+    mongo.db.usuarios.update_one({"_id": usuario["_id"]}, {"$set": update_data})
 
     return jsonify({"message": "Rol actualizado correctamente"}), 200
 
 @users_bp.route("/mostrar_usuarios", methods=["GET"])
 @allow_cors
-def mostrar_usuarios():
+@token_required
+def mostrar_usuarios(user):
     """
     Listar usuarios con paginación
     ---
@@ -291,21 +408,46 @@ def mostrar_usuarios():
               type: integer
     """
     params = request.args
-    skip = int(params.get("page")) if params.get("page") else 0
+    page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
     text = params.get("text")
+    if page < 0:
+        page = 0
+    if limit <= 0:
+        limit = 10
 
-    query = {}
+    filters = []
     if text:
-        query = {
+        filters.append({
             "$or": [
                 {"nombre": {"$regex": text, "$options": "i"}},
                 {"email": {"$regex": text, "$options": "i"}},
             ]
-        }
-    list_users = mongo.db.usuarios.find(query).skip(skip * limit).limit(limit)
+        })
+
+    scope_filter = department_scope_filter(user)
+    if scope_filter:
+        filters.append(scope_filter)
+
+    if len(filters) > 1:
+        query = {"$and": filters}
+    elif len(filters) == 1:
+        query = filters[0]
+    else:
+        query = {}
+
+    projection = {"password": 0}
+    list_users = mongo.db.usuarios.find(query, projection=projection).skip(page * limit).limit(limit)
     quantity = mongo.db.usuarios.count_documents(query)
     list_cursor = list(list_users)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump.replace("\\", ""))
+    for item in list_json:
+        dep_id = item.get("departamento_id")
+        if isinstance(dep_id, dict):
+            dep_id = dep_id.get("$oid")
+            item["departamento_id"] = dep_id
+        if dep_id:
+            item["departmentId"] = dep_id
+
     return jsonify(request_list=list_json, count=quantity)

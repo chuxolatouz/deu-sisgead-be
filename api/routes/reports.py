@@ -7,12 +7,37 @@ from collections import defaultdict
 from api.extensions import mongo
 from api.util.decorators import token_required
 from api.services.project_funding_service import ProjectFundingService
+from api.util.access import (
+    can_access_project,
+    is_super_admin,
+    parse_object_id,
+    user_department_id,
+)
 
 reports_bp = Blueprint('reports', __name__)
 
+
+def _forbidden(message="No autorizado"):
+    return jsonify({"message": message}), 403
+
+
+def _get_project_with_access(user, project_id):
+    project_object_id = parse_object_id(project_id)
+    if not project_object_id:
+        return None, (jsonify({"message": "ID de proyecto inválido"}), 400)
+
+    project = mongo.db.proyectos.find_one({"_id": project_object_id})
+    if not project:
+        return None, (jsonify({"message": "Proyecto no encontrado"}), 404)
+
+    if not can_access_project(user, project):
+        return None, _forbidden("No autorizado para acceder a este proyecto")
+
+    return project, None
+
 @reports_bp.route('/reporte/proyecto/<string:proyecto_id>', methods=['GET'])
 @token_required
-def generar_reporte_proyecto(data, proyecto_id):
+def generar_reporte_proyecto(user, proyecto_id):
     """
     Generar reporte financiero de proyecto
     ---
@@ -68,12 +93,13 @@ def generar_reporte_proyecto(data, proyecto_id):
             error:
               type: string
     """
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
-    if not proyecto:
-        return jsonify({"error": "Proyecto no encontrado"}), 404
+    proyecto, error_response = _get_project_with_access(user, proyecto_id)
+    if error_response:
+        return error_response
+    project_object_id = proyecto["_id"]
 
     presupuestos = list(
-        mongo.db.documentos.find({"$or": [{"project_id": ObjectId(proyecto_id)}, {"proyecto_id": ObjectId(proyecto_id)}]})
+        mongo.db.documentos.find({"$or": [{"project_id": project_object_id}, {"proyecto_id": project_object_id}]})
     )
     report_payload = ProjectFundingService.report_payload(proyecto)
     saldo_inicial = report_payload["saldo_inicial"]
@@ -110,7 +136,8 @@ def generar_reporte_proyecto(data, proyecto_id):
     return jsonify(reporte), 200
 
 @reports_bp.route('/proyecto/<id>/reporte', methods=['GET'])
-def obtener_reporte_proyecto(id):
+@token_required
+def obtener_reporte_proyecto(user, id):
     """
     Obtener reporte de balance y egresos de proyecto
     ---
@@ -173,15 +200,12 @@ def obtener_reporte_proyecto(id):
             message:
               type: string
     """
-    try:
-        project_id = ObjectId(id)
-    except Exception:
-        return jsonify({"message": "ID de proyecto inválido"}), 400
+    proyecto, error_response = _get_project_with_access(user, id)
+    if error_response:
+        return error_response
+    project_id = proyecto["_id"]
 
     acciones = list(mongo.db.acciones.find({"project_id": project_id}).sort("created_at", 1))
-    proyecto = mongo.db.proyectos.find_one({"_id": project_id})
-    if not proyecto:
-        return jsonify({"message": "Proyecto no encontrado"}), 404
 
     report_payload = ProjectFundingService.report_payload(proyecto)
     return jsonify({
@@ -237,19 +261,13 @@ def dashboard_global(user):
 
     # Determine query based on user role and context
     query = {}
-    if user.get("role") == "admin_departamento" or user.get("_using_dept_context"):
-        if "departamento_id" in user:
-            query["departamento_id"] = ObjectId(user["departamento_id"])
-    elif user.get("role") == "super_admin":
-        pass
+    if is_super_admin(user):
+        if user.get("_using_dept_context"):
+            context_department = parse_object_id(user_department_id(user))
+            query = {"departamento_id": context_department} if context_department else {"_id": {"$exists": False}}
     else:
-        # Standard user: only where they are owner or member
-        query = {
-            "$or": [
-                {"owner": ObjectId(user["sub"])},
-                {"miembros.usuario._id.$oid": user["sub"]}
-            ]
-        }
+        actor_department = parse_object_id(user_department_id(user))
+        query = {"departamento_id": actor_department} if actor_department else {"_id": {"$exists": False}}
 
     projects = list(mongo.db.proyectos.find(query))
     project_ids = [p["_id"] for p in projects]
@@ -274,10 +292,22 @@ def dashboard_global(user):
     total_miembros = len(miembros_set)
 
     # Presupuestos
-    total_presupuestos = mongo.db.documentos.count_documents({"proyecto_id": {"$in": project_ids}})
+    total_presupuestos = mongo.db.documentos.count_documents({
+        "$or": [
+            {"project_id": {"$in": project_ids}},
+            {"proyecto_id": {"$in": project_ids}},
+        ]
+    })
     total_presupuestos_finalizados = mongo.db.documentos.count_documents({
-        "proyecto_id": {"$in": project_ids},
-        "status": "finished"
+        "$and": [
+            {
+                "$or": [
+                    {"project_id": {"$in": project_ids}},
+                    {"proyecto_id": {"$in": project_ids}},
+                ]
+            },
+            {"status": "finished"},
+        ]
     })
 
     # Ocurrencias (Participation in top projects)
@@ -346,7 +376,14 @@ def dashboard_global(user):
             balance_history.append({"fecha": d, "saldo": running_total})
 
     # Usuarios Totales
-    total_usuarios = mongo.db.usuarios.count_documents({})
+    if is_super_admin(user) and not user.get("_using_dept_context"):
+        total_usuarios = mongo.db.usuarios.count_documents({})
+    else:
+        actor_department = parse_object_id(user_department_id(user))
+        if actor_department:
+            total_usuarios = mongo.db.usuarios.count_documents({"departamento_id": actor_department})
+        else:
+            total_usuarios = 0
 
     response = {
         "balanceHistory": balance_history,

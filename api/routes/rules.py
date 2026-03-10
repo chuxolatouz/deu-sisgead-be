@@ -8,6 +8,7 @@ from api.util.decorators import token_required, allow_cors
 from api.util.common import agregar_log
 from api.util.utils import int_to_string, actualizar_pasos
 from api.services.project_funding_service import ProjectFundingService
+from api.util.access import can_access_project, parse_object_id
 
 rules_bp = Blueprint('rules', __name__)
 
@@ -21,6 +22,16 @@ def _pick_value(data, *keys):
 
 def _clean_str(value):
     return str(value or "").strip()
+
+
+def _forbidden(message="No autorizado"):
+    return jsonify({"message": message}), 403
+
+
+def _ensure_project_access(user, project):
+    if not can_access_project(user, project):
+        return _forbidden("No autorizado para acceder a este proyecto")
+    return None
 
 @rules_bp.route("/crear_solicitud_regla_fija", methods=["POST"])
 @token_required
@@ -212,11 +223,23 @@ def asignar_regla_fija(user):
     if not proyecto_id or not regla_id:
         return jsonify({"message": "projectId y ruleId son requeridos"}), 400
 
-    proyecto = mongo.db.proyectos.find_one({"_id": ObjectId(proyecto_id)})
+    proyecto_object_id = parse_object_id(proyecto_id)
+    if not proyecto_object_id:
+        return jsonify({"message": "projectId inválido"}), 400
+
+    regla_object_id = parse_object_id(regla_id)
+    if not regla_object_id:
+        return jsonify({"message": "ruleId inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": proyecto_object_id})
     if proyecto is None:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    regla = mongo.db.solicitudes.find_one({"_id": ObjectId(regla_id)})
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
+    regla = mongo.db.solicitudes.find_one({"_id": regla_object_id})
     if regla is None:
         return jsonify({"message": "Regla fija no encontrada"}), 404
     account_mappings = data.get("accountMappings") or []
@@ -255,8 +278,8 @@ def asignar_regla_fija(user):
                 description=f"Regla fija {regla['nombre']} - {item['nombre_regla']}",
                 reference={
                     "kind": "fixed_rule",
-                    "ruleId": str(regla_id),
-                    "projectId": str(proyecto_id),
+                    "ruleId": str(regla_object_id),
+                    "projectId": str(proyecto_object_id),
                     "actorName": user.get("nombre", "Usuario"),
                     "title": "Consumo por regla fija",
                     "accountCode": account_code,
@@ -275,7 +298,7 @@ def asignar_regla_fija(user):
     new_status, _ = actualizar_pasos(proyecto["status"], 5)
 
     mongo.db.proyectos.update_one(
-        {"_id": ObjectId(proyecto_id)},
+        {"_id": proyecto_object_id},
         {"$set": {"regla_fija": {**regla, "accountMappings": account_mappings}, "status": new_status}},
     )
 
