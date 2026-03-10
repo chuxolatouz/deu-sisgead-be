@@ -18,7 +18,7 @@ departments_bp = Blueprint('departments', __name__)
 def _serialize_cursor(cursor):
     list_cursor = list(cursor)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    return json.loads(list_dump.replace("\\", ""))
+    return json.loads(list_dump)
 
 
 @departments_bp.route("/departamentos", methods=["POST"])
@@ -199,7 +199,7 @@ def obtener_departamento(user, departamento_id):
     
     departamento["_id"] = str(departamento["_id"])
     departamento_dump = json.dumps(departamento, default=json_util.default, ensure_ascii=False)
-    departamento_json = json.loads(departamento_dump.replace("\\", ""))
+    departamento_json = json.loads(departamento_dump)
     
     return jsonify(departamento_json), 200
 

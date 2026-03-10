@@ -109,7 +109,7 @@ def mostrar_documentos_proyecto(user, id):
     quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(documentos)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
     for documento in list_json:
         project_id = documento.get("project_id")
         if isinstance(project_id, dict):

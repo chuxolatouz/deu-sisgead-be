@@ -208,7 +208,7 @@ def roles():
     roles = mongo.db.roles.find({})
     list_cursor = list(roles)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
     return jsonify(list_json)
 
 @users_bp.route("/crear_rol", methods=["POST"])
@@ -441,7 +441,7 @@ def mostrar_usuarios(user):
     quantity = mongo.db.usuarios.count_documents(query)
     list_cursor = list(list_users)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
 
     department_object_ids = []
     for item in list_json:

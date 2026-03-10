@@ -181,7 +181,7 @@ def mostrar_reglas_fijas(user):
     list_request = mongo.db.solicitudes.find({"status": "completed"})
     list_cursor = list(list_request)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
     return jsonify(request_list=list_json), 200
 
 @rules_bp.route("/asignar_regla_fija/", methods=["POST"])
@@ -343,5 +343,5 @@ def mostrar_solicitudes(user):
     quantity = mongo.db.solicitudes.count_documents({})
     list_cursor = list(list_verification_request)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
     return jsonify(request_list=list_json, count=quantity)

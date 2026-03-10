@@ -742,7 +742,7 @@ def mostrar_proyectos(user):
     quantity = mongo.db.proyectos.count_documents(query)
     list_cursor = [ProjectFundingService.decorate_project(project) for project in list(list_verification_request)]
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
     for project in list_json:
         departamento_id = project.get("departamento_id")
         if isinstance(departamento_id, dict):
@@ -853,7 +853,7 @@ def acciones_proyecto(user, id):
     quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(acciones)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
     return jsonify(request_list=list_json, count=quantity)
 
 @projects_bp.route("/proyecto/<string:id>", methods=["GET"])
@@ -1088,7 +1088,7 @@ def obtener_logs(user, id):
     quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(acciones)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
-    list_json = json.loads(list_dump.replace("\\", ""))
+    list_json = json.loads(list_dump)
     return jsonify(request_list=list_json, count=quantity), 200
 
 @projects_bp.route("/proyecto/<string:id>/movimientos/descargar", methods=["GET"])
@@ -1181,8 +1181,8 @@ def mostrar_finalizacion(user, id):
     docs = mongo.db.documentos.find({"project_id": project_object_id})
     logs = mongo.db.logs.find({"id_proyecto": project_object_id})
 
-    movs_json = json.loads(json_util.dumps(list(movs)).replace("\\", ""))
-    docs_json = json.loads(json_util.dumps(list(docs)).replace("\\", ""))
-    logs_json = json.loads(json_util.dumps(list(logs)).replace("\\", ""))
+    movs_json = json.loads(json_util.dumps(list(movs), default=json_util.default, ensure_ascii=False))
+    docs_json = json.loads(json_util.dumps(list(docs), default=json_util.default, ensure_ascii=False))
+    logs_json = json.loads(json_util.dumps(list(logs), default=json_util.default, ensure_ascii=False))
 
     return jsonify(logs=logs_json, documentos=docs_json, movimientos=movs_json), 200
