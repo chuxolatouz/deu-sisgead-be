@@ -136,6 +136,56 @@ class ProjectFundingService:
         return rows
 
     @staticmethod
+    def _historical_initial_assigned(project: Dict[str, Any], year: int = DEFAULT_YEAR) -> float:
+        project_object_id = project.get("_id")
+        project_id = str(project_object_id) if project_object_id else ""
+        if not project_id:
+            return 0.0
+
+        ledger_total = 0.0
+        ledger_rows = list(
+            mongo.db.ledger_movements.find(
+                {
+                    "year": int(year),
+                    "scopeType": "project",
+                    "scopeId": project_id,
+                    "type": "debit",
+                },
+                {"amount": 1, "reference": 1},
+            )
+        )
+        for row in ledger_rows:
+            reference = row.get("reference") or {}
+            funding_type = _clean_str(reference.get("fundingType")).lower()
+            kind = _clean_str(reference.get("kind")).lower()
+            if funding_type in {"funding", "migration"} or kind == "transfer":
+                ledger_total += float(row.get("amount", 0) or 0)
+
+        if ledger_total > 0:
+            return round(ledger_total, 2)
+
+        legacy_total = 0.0
+        legacy_actions = list(
+            mongo.db.acciones.find(
+                {
+                    "$or": [
+                        {"project_id": project_object_id},
+                        {"project_id": project_id},
+                        {"proyecto_id": project_object_id},
+                        {"proyecto_id": project_id},
+                    ]
+                },
+                {"amount": 1, "type": 1},
+            )
+        )
+        for row in legacy_actions:
+            action_type = _clean_str(row.get("type")).lower()
+            if action_type == "fondeo":
+                legacy_total += _cents_to_units(row.get("amount", 0))
+
+        return round(legacy_total, 2)
+
+    @staticmethod
     def _derived_totals(project: Dict[str, Any], year: int = DEFAULT_YEAR) -> Dict[str, Any]:
         ProjectFundingService.ensure_model(project, persist=True)
         project_id = str(project.get("_id"))
@@ -152,6 +202,11 @@ class ProjectFundingService:
         else:
             current_available = round(sum(float(item.get("balance", 0) or 0) for item in rows), 2)
             initial_assigned = _cents_to_units(model.get("initialAssignedAmount"))
+            if initial_assigned <= 0:
+                initial_assigned = ProjectFundingService._historical_initial_assigned(project, year=year)
+                # Backward compatibility for rows without persisted initial amount or movement history.
+                if initial_assigned <= 0 and current_available > 0:
+                    initial_assigned = current_available
             funded_accounts_count = sum(1 for item in rows if float(item.get("balance", 0) or 0) > 0)
             last_movement_at = None
             dates = [item.get("lastMovementAt") for item in rows if item.get("lastMovementAt")]

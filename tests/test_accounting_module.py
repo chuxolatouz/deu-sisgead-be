@@ -412,6 +412,135 @@ def test_project_funding_summary_legacy_uses_snapshots(monkeypatch):
     assert summary["totals"]["initialAssigned"] == 1500.0
 
 
+def test_project_funding_summary_uses_current_available_when_initial_missing(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+
+    project = {
+        "_id": ObjectId(),
+        "nombre": "Proyecto Active",
+        "balance": 0,
+        "balance_inicial": 0,
+        "status": {"actual": 1, "completado": []},
+        "fundingModel": {
+            "version": 2,
+            "status": "active",
+            "configuredAt": None,
+            "migratedAt": None,
+            "migratedBy": None,
+            "initialAssignedAmount": 0,
+            "legacyCurrentBalanceSnapshot": None,
+            "legacyInitialBalanceSnapshot": None,
+            "migrationNote": None,
+        },
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+    mongo_stub.db.master_accounts.rows.append(
+        {
+            "year": 2026,
+            "code": "403109900000",
+            "description": "Cuenta detalle",
+            "group": "EGRESO",
+            "is_header": False,
+            "level": 4,
+            "parent_code": "403100000000",
+        }
+    )
+    mongo_stub.db.account_scope_state.rows.append(
+        {
+            "year": 2026,
+            "scopeType": "project",
+            "scopeId": str(project["_id"]),
+            "accountCode": "403109900000",
+            "balance": 300.0,
+            "movementsCount": 1,
+            "lastMovementAt": None,
+        }
+    )
+
+    summary = ProjectFundingService.build_summary(project, year=2026, user={"role": "super_admin"})
+
+    assert summary["totals"]["currentAvailable"] == 300.0
+    assert summary["totals"]["initialAssigned"] == 300.0
+
+
+def test_project_funding_summary_uses_historical_funding_when_initial_missing(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+
+    project_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "nombre": "Proyecto Active",
+        "balance": 0,
+        "balance_inicial": 0,
+        "status": {"actual": 1, "completado": []},
+        "fundingModel": {
+            "version": 2,
+            "status": "active",
+            "configuredAt": None,
+            "migratedAt": None,
+            "migratedBy": None,
+            "initialAssignedAmount": 0,
+            "legacyCurrentBalanceSnapshot": None,
+            "legacyInitialBalanceSnapshot": None,
+            "migrationNote": None,
+        },
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+    mongo_stub.db.master_accounts.rows.append(
+        {
+            "year": 2026,
+            "code": "403109900000",
+            "description": "Cuenta detalle",
+            "group": "EGRESO",
+            "is_header": False,
+            "level": 4,
+            "parent_code": "403100000000",
+        }
+    )
+    mongo_stub.db.account_scope_state.rows.append(
+        {
+            "year": 2026,
+            "scopeType": "project",
+            "scopeId": str(project_id),
+            "accountCode": "403109900000",
+            "balance": 200.0,
+            "movementsCount": 2,
+            "lastMovementAt": None,
+        }
+    )
+    mongo_stub.db.ledger_movements.rows.extend(
+        [
+            {
+                "_id": ObjectId(),
+                "year": 2026,
+                "scopeType": "project",
+                "scopeId": str(project_id),
+                "accountCode": "403109900000",
+                "type": "debit",
+                "amount": 300.0,
+                "reference": {"kind": "transfer", "fundingType": "funding"},
+            },
+            {
+                "_id": ObjectId(),
+                "year": 2026,
+                "scopeType": "project",
+                "scopeId": str(project_id),
+                "accountCode": "403109900000",
+                "type": "credit",
+                "amount": 100.0,
+                "reference": {"kind": "project_expense"},
+            },
+        ]
+    )
+
+    summary = ProjectFundingService.build_summary(project, year=2026, user={"role": "super_admin"})
+
+    assert summary["totals"]["currentAvailable"] == 200.0
+    assert summary["totals"]["initialAssigned"] == 300.0
+
+
 def test_allocate_funds_updates_project_and_states(monkeypatch):
     mongo_stub = MongoStub()
     monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
