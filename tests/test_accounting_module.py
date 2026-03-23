@@ -233,6 +233,52 @@ def test_rbac_department_basico():
     assert accounting_routes._can_access_department(user_dep_bad, "dep-1") is False
 
 
+def test_mostrar_proyectos_incluye_metadata_departamento(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+
+    department_id = ObjectId()
+    project_id = ObjectId()
+
+    mongo_stub.db.departamentos.rows.append(
+        {
+            "_id": department_id,
+            "codigo": "DEP-01",
+            "nombre": "Planificacion",
+        }
+    )
+    mongo_stub.db.proyectos.rows.append(
+        {
+            "_id": project_id,
+            "nombre": "Proyecto de prueba",
+            "descripcion": "Descripcion",
+            "fecha_inicio": "2026-01-01",
+            "fecha_fin": "2026-12-31",
+            "departamento_id": department_id,
+            "balance": 0,
+            "balance_inicial": 0,
+            "status": {"actual": 1, "completado": []},
+        }
+    )
+
+    app = create_app()
+    with app.test_request_context("/mostrar_proyectos?page=0&limit=10"):
+        response = project_routes.mostrar_proyectos.__wrapped__.__wrapped__({"role": "super_admin"})
+
+    payload = response.get_json()
+    assert payload["count"] == 1
+    assert len(payload["request_list"]) == 1
+
+    project = payload["request_list"][0]
+    assert project["departmentId"] == str(department_id)
+    assert project["departmentName"] == "Planificacion"
+    assert project["departmentCode"] == "DEP-01"
+    assert project["departamento"]["_id"] == str(department_id)
+    assert project["departamento"]["nombre"] == "Planificacion"
+
+
 def test_transfer_between_accounts_actualiza_ambas(monkeypatch):
     mongo_stub = MongoStub()
     monkeypatch.setattr(accounting_service, "mongo", mongo_stub)

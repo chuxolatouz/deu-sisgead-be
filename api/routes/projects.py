@@ -73,6 +73,57 @@ def _extract_member_user_id(member):
     return str(value)
 
 
+def _normalize_project_department_id(item):
+    department_id = item.get("departamento_id")
+    if isinstance(department_id, dict):
+        department_id = department_id.get("$oid")
+    elif isinstance(department_id, ObjectId):
+        department_id = str(department_id)
+
+    if department_id:
+        item["departamento_id"] = department_id
+        item["departmentId"] = department_id
+
+    return department_id
+
+
+def _attach_project_department_metadata(items):
+    department_object_ids = []
+
+    for item in items:
+        department_id = _normalize_project_department_id(item)
+        if department_id and ObjectId.is_valid(department_id):
+            department_object_ids.append(ObjectId(department_id))
+
+    if not department_object_ids:
+        return items
+
+    departments = mongo.db.departamentos.find(
+        {"_id": {"$in": list({department_id for department_id in department_object_ids})}},
+        {"_id": 1, "codigo": 1, "nombre": 1},
+    )
+    department_map = {str(department["_id"]): department for department in departments}
+
+    for item in items:
+        department_id = item.get("departmentId")
+        if not department_id:
+            continue
+
+        department = department_map.get(str(department_id))
+        if not department:
+            continue
+
+        item["departmentCode"] = department.get("codigo")
+        item["departmentName"] = department.get("nombre")
+        item["departamento"] = {
+            "_id": department_id,
+            "codigo": department.get("codigo"),
+            "nombre": department.get("nombre"),
+        }
+
+    return items
+
+
 def _normalize_project_payload(data):
     alias_map = {
         "fechaInicio": "fecha_inicio",
@@ -743,13 +794,7 @@ def mostrar_proyectos(user):
     list_cursor = [ProjectFundingService.decorate_project(project) for project in list(list_verification_request)]
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump)
-    for project in list_json:
-        departamento_id = project.get("departamento_id")
-        if isinstance(departamento_id, dict):
-            departamento_id = departamento_id.get("$oid")
-            project["departamento_id"] = departamento_id
-        if departamento_id:
-            project["departmentId"] = departamento_id
+    _attach_project_department_metadata(list_json)
     return jsonify(request_list=list_json, count=quantity)
 
 @projects_bp.route('/proyecto/<string:proyecto_id>/objetivos', methods=['GET'])
