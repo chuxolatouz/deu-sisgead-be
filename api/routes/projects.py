@@ -161,6 +161,16 @@ def _allow_legacy_project_balance() -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "si"}
 
 
+def _resolve_funding_year():
+    year_param = request.args.get("year")
+    if year_param:
+        try:
+            return int(year_param), None
+        except Exception:
+            return None, (jsonify({"message": "Año inválido"}), 400)
+    return datetime.now(timezone.utc).year, None
+
+
 def _normalize_category_reference(value):
     if value in (None, ""):
         return None
@@ -776,6 +786,9 @@ def mostrar_proyectos(user):
     page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
     skip = page * limit  # Calcular skip basado en page y limit
+    funding_year, year_error = _resolve_funding_year()
+    if year_error:
+        return year_error
     
     if is_super_admin(user):
         if user.get("_using_dept_context"):
@@ -791,10 +804,15 @@ def mostrar_proyectos(user):
 
     list_verification_request = mongo.db.proyectos.find(query, projection=projection).skip(skip).limit(limit)
     quantity = mongo.db.proyectos.count_documents(query)
-    list_cursor = [ProjectFundingService.decorate_project(project) for project in list(list_verification_request)]
+    list_cursor = [
+        ProjectFundingService.decorate_project(project, year=funding_year, user=user)
+        for project in list(list_verification_request)
+    ]
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump)
     _attach_project_department_metadata(list_json)
+    for project in list_json:
+        project["fundingYear"] = funding_year
     return jsonify(request_list=list_json, count=quantity)
 
 @projects_bp.route('/proyecto/<string:proyecto_id>/objetivos', methods=['GET'])
@@ -938,14 +956,9 @@ def proyecto(user, id):
     if access_error:
         return access_error
 
-    year_param = request.args.get("year")
-    if year_param:
-        try:
-            funding_year = int(year_param)
-        except Exception:
-            return jsonify({"message": "Año inválido"}), 400
-    else:
-        funding_year = datetime.now(timezone.utc).year
+    funding_year, year_error = _resolve_funding_year()
+    if year_error:
+        return year_error
 
     proyecto = ProjectFundingService.decorate_project(proyecto, year=funding_year, user=user)
     proyecto_dump = json_util.dumps(proyecto, default=json_util.default, ensure_ascii=False)

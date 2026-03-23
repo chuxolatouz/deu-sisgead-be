@@ -279,6 +279,62 @@ def test_mostrar_proyectos_incluye_metadata_departamento(monkeypatch):
     assert project["departamento"]["nombre"] == "Planificacion"
 
 
+def test_mostrar_proyectos_usa_anio_actual_para_balance(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+
+    current_year = datetime.now(timezone.utc).year
+    project_id = ObjectId()
+
+    mongo_stub.db.master_accounts.rows.append(
+        {
+            "year": current_year,
+            "code": "401010100000",
+            "description": "Cuenta detalle",
+            "group": "EGRESO",
+            "is_header": False,
+            "level": 4,
+            "parent_code": "401010000000",
+        }
+    )
+    mongo_stub.db.account_scope_state.rows.append(
+        {
+            "year": current_year,
+            "scopeType": "project",
+            "scopeId": str(project_id),
+            "accountCode": "401010100000",
+            "balance": 250.0,
+            "movementsCount": 1,
+            "lastMovementAt": datetime.now(timezone.utc),
+        }
+    )
+    mongo_stub.db.proyectos.rows.append(
+        {
+            "_id": project_id,
+            "nombre": "Proyecto con saldo",
+            "descripcion": "Descripcion",
+            "fecha_inicio": "2026-01-01",
+            "fecha_fin": "2026-12-31",
+            "balance": 0,
+            "balance_inicial": 0,
+            "status": {"actual": 1, "completado": []},
+        }
+    )
+
+    app = create_app()
+    with app.test_request_context("/mostrar_proyectos?page=0&limit=10"):
+        response = project_routes.mostrar_proyectos.__wrapped__.__wrapped__({"role": "super_admin"})
+
+    payload = response.get_json()
+    assert payload["count"] == 1
+    project = payload["request_list"][0]
+    assert project["fundingYear"] == current_year
+    assert project["balance"] == 250.0
+    assert project["fundingSummary"]["totals"]["currentAvailable"] == 250.0
+
+
 def test_transfer_between_accounts_actualiza_ambas(monkeypatch):
     mongo_stub = MongoStub()
     monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
