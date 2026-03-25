@@ -18,6 +18,7 @@ from api.extensions import mongo
 
 DEFAULT_YEAR = 2025
 DEFAULT_CURRENCY = "VES"
+ALLOWED_INCOME_TYPES = {"ordinary", "own"}
 
 
 def _now_utc() -> datetime:
@@ -43,6 +44,21 @@ def _clean_str(value: Any) -> str:
     if value is None:
         return ""
     return str(value).strip()
+
+
+def _normalize_income_type(value: Any) -> Optional[str]:
+    cleaned = _clean_str(value).lower()
+    if not cleaned:
+        return None
+    if cleaned in ALLOWED_INCOME_TYPES:
+        return cleaned
+    return None
+
+
+def _with_income_type(row: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(row)
+    item["incomeType"] = _normalize_income_type(item.get("incomeType"))
+    return item
 
 
 @dataclass
@@ -134,7 +150,7 @@ class AccountCatalogService:
                 query["code"] = {"$in": sorted(visible_codes)}
 
         cursor = mongo.db.master_accounts.find(query, {"_id": 0}).sort("code", 1).limit(max(1, min(limit, 500)))
-        rows = list(cursor)
+        rows = [_with_income_type(row) for row in cursor]
 
         if scope_type and scope_id:
             enriched = []
@@ -160,7 +176,7 @@ class AccountCatalogService:
         if group:
             query["group"] = group.upper()
 
-        accounts = list(mongo.db.master_accounts.find(query, {"_id": 0}).sort("code", 1))
+        accounts = [_with_income_type(row) for row in mongo.db.master_accounts.find(query, {"_id": 0}).sort("code", 1)]
         return _build_tree(accounts)
 
     @staticmethod
@@ -237,7 +253,10 @@ class AccountScopeService:
         if group:
             accounts_query["group"] = group.upper()
 
-        accounts = list(mongo.db.master_accounts.find(accounts_query, {"_id": 0}).sort("code", 1))
+        accounts = [
+            _with_income_type(row)
+            for row in mongo.db.master_accounts.find(accounts_query, {"_id": 0}).sort("code", 1)
+        ]
         states_cursor = mongo.db.account_scope_state.find(
             {"year": int(year), "scopeType": scope_type, "scopeId": scope_id},
             {"_id": 0, "accountCode": 1, "balance": 1, "movementsCount": 1, "lastMovementAt": 1},
@@ -669,6 +688,7 @@ class SeedService:
                     "is_header": row["is_header"],
                     "level": row["level"],
                     "parent_code": row["parent_code"],
+                    "incomeType": row.get("incomeType"),
                     "updatedAt": _now_utc(),
                 }
                 for row in accounts
@@ -892,6 +912,12 @@ class SeedService:
                         "is_header": _is_truthy(raw.get("es_titular")) or _clean_str(raw.get("tipo")).upper() == "T",
                         "level": int(float(raw.get("nivel") or 0)),
                         "parent_code": _clean_str(raw.get("padre") or raw.get("parent_code")) or None,
+                        "incomeType": _normalize_income_type(
+                            raw.get("incomeType")
+                            or raw.get("income_type")
+                            or raw.get("tipo_ingreso")
+                            or raw.get("tipo de ingreso")
+                        ),
                     }
                 )
         return rows

@@ -14,6 +14,7 @@ from api.services.accounting_service import (
     SeedService,
     DEFAULT_YEAR,
     AccountingIndexes,
+    ALLOWED_INCOME_TYPES,
 )
 from api.services.project_funding_service import ProjectFundingService
 from api.util.common import agregar_log
@@ -102,6 +103,17 @@ def _query_truthy(value: Optional[str], default: bool = False) -> bool:
     if value is None:
         return default
     return str(value).strip().lower() in {"1", "true", "yes", "si", "on"}
+
+
+def _normalize_income_type(value: Any, *, required: bool = False) -> Optional[str]:
+    cleaned = str(value or "").strip().lower()
+    if not cleaned:
+        if required:
+            raise ValueError("incomeType es requerido")
+        return None
+    if cleaned not in ALLOWED_INCOME_TYPES:
+        raise ValueError("incomeType debe ser ordinary o own")
+    return cleaned
 
 
 @accounting_bp.route("/accounts/tree", methods=["GET"])
@@ -498,6 +510,7 @@ def admin_list_accounts(user):
     response_rows = []
     for row in rows:
         row_copy = dict(row)
+        row_copy["incomeType"] = row_copy.get("incomeType") or None
         row_copy["balance"] = balance_by_code.get(row["code"], 0.0)
         response_rows.append(row_copy)
 
@@ -521,6 +534,10 @@ def admin_create_account(user):
     parent_code = str(data.get("parent_code", "")).strip() or None
     level = int(data.get("level", 1))
     is_header = bool(data.get("is_header", False))
+    try:
+        income_type = _normalize_income_type(data.get("incomeType"), required=True)
+    except ValueError as exc:
+        return jsonify({"message": str(exc)}), 400
 
     if not code or len(code) != 12 or not code.isdigit():
         return jsonify({"message": "code debe ser string numérico de 12 dígitos"}), 400
@@ -545,6 +562,7 @@ def admin_create_account(user):
             "is_header": is_header,
             "level": level,
             "parent_code": parent_code,
+            "incomeType": income_type,
             "createdAt": now,
             "updatedAt": now,
         }
@@ -564,7 +582,7 @@ def admin_update_account(user, code):
     year = _parse_year()
     data = request.get_json(silent=True) or {}
     update_fields = {}
-    allowed = {"description", "group", "is_header", "level", "parent_code"}
+    allowed = {"description", "group", "is_header", "level", "parent_code", "incomeType"}
     for key in allowed:
         if key in data:
             update_fields[key] = data[key]
@@ -580,6 +598,12 @@ def admin_update_account(user, code):
         if parent_code and (len(parent_code) != 12 or not parent_code.isdigit()):
             return jsonify({"message": "parent_code debe ser string numérico de 12 dígitos"}), 400
         update_fields["parent_code"] = parent_code or None
+
+    if "incomeType" in update_fields:
+        try:
+            update_fields["incomeType"] = _normalize_income_type(update_fields.get("incomeType"), required=True)
+        except ValueError as exc:
+            return jsonify({"message": str(exc)}), 400
 
     if not update_fields:
         return jsonify({"message": "No hay campos para actualizar"}), 400

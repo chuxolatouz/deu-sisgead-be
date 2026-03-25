@@ -1,4 +1,4 @@
-from flask import Blueprint, request, jsonify
+from flask import Blueprint, request, jsonify, send_file
 from bson import ObjectId, json_util
 import json
 import os
@@ -15,6 +15,8 @@ from api.services.project_funding_service import ProjectFundingService
 from api.util.access import can_access_project, parse_object_id
 
 documents_bp = Blueprint('documents', __name__)
+ALLOWED_RESULT_IMAGE_EXTENSIONS = {".png", ".gif", ".jpeg", ".jpg"}
+ALLOWED_RESULT_IMAGE_MIME_PREFIX = "image/"
 
 
 def _pick_form_value(*keys):
@@ -30,6 +32,23 @@ def _pick_json_value(data, *keys):
         if key in data and data.get(key) not in (None, ""):
             return data.get(key)
     return None
+
+
+def _is_allowed_result_image(file_storage):
+    filename = (getattr(file_storage, "filename", "") or "").strip().lower()
+    _, ext = os.path.splitext(filename)
+    mimetype = (getattr(file_storage, "mimetype", "") or "").strip().lower()
+    return ext in ALLOWED_RESULT_IMAGE_EXTENSIONS or mimetype.startswith(ALLOWED_RESULT_IMAGE_MIME_PREFIX)
+
+
+def _with_result_attachment_links(doc_id, attachments):
+    output = []
+    for index, attachment in enumerate(attachments or []):
+        item = dict(attachment)
+        if not item.get("download_url") and item.get("ruta"):
+            item["download_url"] = f"/documentos/{doc_id}/resultados/{index}"
+        output.append(item)
+    return output
 
 
 def _forbidden(message="No autorizado"):
@@ -103,9 +122,14 @@ def mostrar_documentos_proyecto(user, id):
     params = request.args
     page = int(params.get("page")) if params.get("page") else 0
     limit = int(params.get("limit")) if params.get("limit") else 10
+    status = (params.get("status") or "").strip().lower()
     skip = page * limit  # Calcular skip basado en page y limit
-    documentos = mongo.db.documentos.find({"project_id": project_object_id}).skip(skip).limit(limit)
-    total_items = mongo.db.documentos.count_documents({"project_id": project_object_id})
+    query = {"project_id": project_object_id}
+    if status in {"new", "finished"}:
+        query["status"] = status
+
+    documentos = mongo.db.documentos.find(query).skip(skip).limit(limit)
+    total_items = mongo.db.documentos.count_documents(query)
     quantity = math.ceil(total_items / limit) if limit > 0 else 1
     list_cursor = list(documentos)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
@@ -123,7 +147,48 @@ def mostrar_documentos_proyecto(user, id):
             documento["transferAmount"] = documento.get("monto_transferencia")
         if "cuenta_contable" in documento:
             documento["accountCode"] = documento.get("cuenta_contable")
+        documento["resultDescription"] = documento.get("description")
+        documento["resultAttachments"] = _with_result_attachment_links(
+            documento.get("_id", {}).get("$oid"),
+            documento.get("archivos_aprobado", []),
+        )
     return jsonify(request_list=list_json, count=quantity)
+
+
+@documents_bp.route("/documentos/<string:doc_id>/resultados/<int:file_index>", methods=["GET"])
+@allow_cors
+@token_required
+def descargar_resultado(user, doc_id, file_index):
+    documento_object_id = parse_object_id(doc_id)
+    if not documento_object_id:
+        return jsonify({"message": "ID de actividad inválido"}), 400
+
+    documento = mongo.db.documentos.find_one({"_id": documento_object_id})
+    if not documento:
+        return jsonify({"message": "Actividad no encontrada"}), 404
+
+    project_object_id = parse_object_id(documento.get("project_id") or documento.get("proyecto_id"))
+    if not project_object_id:
+        return jsonify({"message": "Proyecto inválido"}), 400
+
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id}, {"departamento_id": 1})
+    if not proyecto:
+        return jsonify({"message": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
+    attachments = documento.get("archivos_aprobado") or []
+    if file_index < 0 or file_index >= len(attachments):
+        return jsonify({"message": "Adjunto no encontrado"}), 404
+
+    attachment = attachments[file_index]
+    file_path = attachment.get("ruta")
+    if not file_path or not os.path.exists(file_path):
+        return jsonify({"message": "Archivo no disponible"}), 404
+
+    return send_file(file_path, as_attachment=False, download_name=attachment.get("nombre"))
 
 @documents_bp.route("/documento_crear", methods=["POST"])
 @allow_cors
@@ -290,7 +355,7 @@ def cerrar_presupuesto(user):
     id = _pick_form_value("projectId", "project_id", "proyecto_id")
     doc_id = _pick_form_value("docId", "doc_id")
     data_balance = request.form.get("monto")
-    data_descripcion = _pick_form_value("description", "descripcion")
+    data_descripcion = (_pick_form_value("description", "descripcion") or "").strip()
     
     # Note: Local file storage code was present in original but mixed with DB updates
     # I kept the logic structure but note that 'files' folder might be ephemeral in some deployments.
@@ -304,6 +369,8 @@ def cerrar_presupuesto(user):
         return jsonify({"error": "projectId, docId y monto son requeridos"}), 400
     if not cuenta_contable:
         return jsonify({"error": "accountCode es requerido"}), 400
+    if not data_descripcion:
+        return jsonify({"error": "description es requerido"}), 400
 
     project_object_id = parse_object_id(id)
     if not project_object_id:
@@ -332,10 +399,20 @@ def cerrar_presupuesto(user):
     if not documento_project_id or str(documento_project_id) != str(project_object_id):
         return jsonify({"error": "La actividad no pertenece al proyecto indicado"}), 400
 
+    archivos = request.files.getlist("files")
+    invalid_files = [
+        archivo.filename
+        for archivo in archivos
+        if archivo and (archivo.filename or "").strip() and not _is_allowed_result_image(archivo)
+    ]
+    if invalid_files:
+        return jsonify({"error": "Solo se permiten imágenes PNG, GIF, JPEG o JPG en el cierre de actividad"}), 400
+
     data_balance_int = string_to_int(data_balance)
     amount_units = round(data_balance_int / 100, 2)
 
     try:
+        actor_name = user.get("nombre", "Usuario")
         ProjectFundingService.consume_project_account(
             proyecto,
             year=2025,
@@ -347,7 +424,7 @@ def cerrar_presupuesto(user):
                 "kind": "project_expense",
                 "budgetId": str(doc_id),
                 "projectId": str(id),
-                "actorName": user.get("nombre", "Usuario"),
+                "actorName": actor_name,
                 "title": "Consumo por actividad",
                 "accountCode": cuenta_contable,
                 "referenceNumber": referencia,
@@ -356,14 +433,13 @@ def cerrar_presupuesto(user):
             },
             allow_negative=False,
             log_message=(
-                f'{user["nombre"]} cerro la actividad {data_descripcion} por Bs. {int_to_string(data_balance_int)} '
+                f'{actor_name} cerro la actividad {data_descripcion} por Bs. {int_to_string(data_balance_int)} '
                 f'imputando la partida {cuenta_contable}'
             ),
         )
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
-    archivos = request.files.getlist("files")
     archivos_guardados = []
     
     for archivo in archivos:

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from io import BytesIO
 from types import SimpleNamespace
 
 from bson import ObjectId
@@ -6,10 +7,11 @@ from pymongo import UpdateOne
 
 from api import create_app
 from api.routes import accounting as accounting_routes
+from api.routes import documents as documents_routes
 from api.routes import projects as project_routes
 from api.services import accounting_service
 from api.services import project_funding_service
-from api.services.accounting_service import AccountScopeService, SeedService
+from api.services.accounting_service import AccountCatalogService, AccountScopeService, SeedService
 from api.services.project_funding_service import ProjectFundingService
 
 
@@ -119,15 +121,27 @@ class InMemoryCollection:
         row = next((r for r in self.rows if self._match(r, query)), None)
         if row is None:
             if not upsert:
-                return
+                return SimpleNamespace(matched_count=0, modified_count=0, upserted_id=None)
             row = dict(query)
             row.update(update.get("$setOnInsert", {}))
             self.rows.append(row)
+            matched_count = 0
+            modified_count = 0
+            upserted_id = ObjectId()
+        else:
+            matched_count = 1
+            modified_count = 1
+            upserted_id = None
         for k, v in update.get("$set", {}).items():
             self._assign_field(row, k, v)
         for k, v in update.get("$inc", {}).items():
             current = self._resolve_field(row, k) or 0
             self._assign_field(row, k, current + v)
+        return SimpleNamespace(
+            matched_count=matched_count,
+            modified_count=modified_count,
+            upserted_id=upserted_id,
+        )
 
     def count_documents(self, query):
         return len([r for r in self.rows if self._match(r, query)])
@@ -154,6 +168,7 @@ class InMemoryDB:
         self.account_scope_state = InMemoryCollection()
         self.ledger_movements = InMemoryCollection()
         self.proyectos = InMemoryCollection()
+        self.documentos = InMemoryCollection()
         self.departamentos = InMemoryCollection()
         self.logs = InMemoryCollection()
         self.acciones = InMemoryCollection()
@@ -168,6 +183,14 @@ class MongoStub:
                 raise RuntimeError("no sessions in test")
 
         self.cx = _Client()
+
+
+def _flatten_tree(nodes):
+    out = []
+    for node in nodes:
+        out.append(node)
+        out.extend(_flatten_tree(node.get("children", [])))
+    return out
 
 
 def test_seed_idempotente(monkeypatch):
@@ -333,6 +356,233 @@ def test_mostrar_proyectos_usa_anio_actual_para_balance(monkeypatch):
     assert project["fundingYear"] == current_year
     assert project["balance"] == 250.0
     assert project["fundingSummary"]["totals"]["currentAvailable"] == 250.0
+
+
+def test_admin_accounts_income_type_is_required_and_persisted(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(accounting_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+
+    app = create_app()
+
+    with app.test_request_context(
+        "/api/admin/accounts",
+        method="POST",
+        json={
+            "year": 2025,
+            "code": "401010100000",
+            "description": "Cuenta detalle",
+            "group": "EGRESO",
+            "is_header": False,
+            "level": 4,
+            "parent_code": "401010000000",
+        },
+    ):
+        response, status_code = accounting_routes.admin_create_account.__wrapped__.__wrapped__({"role": "super_admin"})
+
+    assert status_code == 400
+    assert response.get_json()["message"] == "incomeType es requerido"
+
+    with app.test_request_context(
+        "/api/admin/accounts",
+        method="POST",
+        json={
+            "year": 2025,
+            "code": "401010100000",
+            "description": "Cuenta detalle",
+            "group": "EGRESO",
+            "is_header": False,
+            "level": 4,
+            "parent_code": "401010000000",
+            "incomeType": "ordinary",
+        },
+    ):
+        response, status_code = accounting_routes.admin_create_account.__wrapped__.__wrapped__({"role": "super_admin"})
+
+    assert status_code == 201
+    created = mongo_stub.db.master_accounts.find_one({"year": 2025, "code": "401010100000"})
+    assert created["incomeType"] == "ordinary"
+
+    with app.test_request_context(
+        "/api/admin/accounts/401010100000?year=2025",
+        method="PUT",
+        json={"incomeType": "own"},
+    ):
+        response, status_code = accounting_routes.admin_update_account.__wrapped__.__wrapped__(
+            {"role": "super_admin"},
+            "401010100000",
+        )
+
+    assert status_code == 200
+
+    with app.test_request_context("/api/admin/accounts?year=2025&page=0&limit=20"):
+        response, status_code = accounting_routes.admin_list_accounts.__wrapped__.__wrapped__({"role": "super_admin"})
+
+    assert status_code == 200
+    payload = response.get_json()
+    assert payload["request_list"][0]["incomeType"] == "own"
+
+
+def test_account_catalog_outputs_income_type_and_legacy_null(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+
+    mongo_stub.db.master_accounts.rows.extend(
+        [
+            {
+                "year": 2025,
+                "code": "100000000000",
+                "description": "Raiz ordinaria",
+                "group": "INGRESO",
+                "is_header": True,
+                "level": 1,
+                "parent_code": None,
+                "incomeType": "ordinary",
+            },
+            {
+                "year": 2025,
+                "code": "100100000000",
+                "description": "Cuenta legado",
+                "group": "INGRESO",
+                "is_header": False,
+                "level": 2,
+                "parent_code": "100000000000",
+            },
+        ]
+    )
+    mongo_stub.db.account_scope_state.rows.append(
+        {
+            "year": 2025,
+            "scopeType": "project",
+            "scopeId": "proj-1",
+            "accountCode": "100100000000",
+            "balance": 20.0,
+            "movementsCount": 1,
+            "lastMovementAt": None,
+        }
+    )
+
+    search_rows = AccountCatalogService.search(year=2025, group="INGRESO")
+    by_code = {row["code"]: row for row in search_rows}
+    assert by_code["100000000000"]["incomeType"] == "ordinary"
+    assert by_code["100100000000"]["incomeType"] is None
+
+    tree = AccountCatalogService.tree(year=2025, group="INGRESO")
+    flat_tree = _flatten_tree(tree)
+    tree_by_code = {row["code"]: row for row in flat_tree}
+    assert tree_by_code["100000000000"]["incomeType"] == "ordinary"
+    assert tree_by_code["100100000000"]["incomeType"] is None
+
+    scoped = AccountScopeService.get_scope_accounts(
+        year=2025,
+        scope_type="project",
+        scope_id="proj-1",
+        assigned_only=True,
+    )
+    scoped_flat = _flatten_tree(scoped["tree"])
+    scoped_by_code = {row["code"]: row for row in scoped_flat}
+    assert scoped_by_code["100100000000"]["incomeType"] is None
+
+
+def test_mostrar_documentos_resultados_expone_aliases_y_filtro(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+
+    project_id = ObjectId()
+    finished_doc_id = ObjectId()
+
+    mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId()})
+    mongo_stub.db.documentos.rows.extend(
+        [
+            {
+                "_id": finished_doc_id,
+                "project_id": project_id,
+                "descripcion": "Actividad finalizada",
+                "status": "finished",
+                "description": "Resultado final",
+                "archivos_aprobado": [{"nombre": "resultado.jpg", "ruta": "/tmp/resultado.jpg"}],
+            },
+            {
+                "_id": ObjectId(),
+                "project_id": project_id,
+                "descripcion": "Actividad nueva",
+                "status": "new",
+            },
+        ]
+    )
+
+    app = create_app()
+    with app.test_request_context(f"/proyecto/{project_id}/documentos?page=0&limit=10&status=finished"):
+        response = documents_routes.mostrar_documentos_proyecto.__wrapped__.__wrapped__({"role": "super_admin"}, str(project_id))
+
+    payload = response.get_json()
+    assert payload["count"] == 1
+    assert len(payload["request_list"]) == 1
+    result = payload["request_list"][0]
+    assert result["resultDescription"] == "Resultado final"
+    assert result["resultAttachments"][0]["download_url"].endswith(f"/documentos/{finished_doc_id}/resultados/0")
+
+
+def test_cerrar_presupuesto_acepta_imagenes_y_rechaza_archivos_invalidos(monkeypatch, tmp_path):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(documents_routes.ProjectFundingService, "consume_project_account", lambda *args, **kwargs: None)
+    monkeypatch.chdir(tmp_path)
+
+    project_id = ObjectId()
+    doc_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId(), "nombre": "Proyecto"})
+    mongo_stub.db.documentos.rows.append({"_id": doc_id, "project_id": project_id, "descripcion": "Actividad"})
+
+    app = create_app()
+
+    with app.test_request_context(
+        "/documento_cerrar",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "docId": str(doc_id),
+            "monto": "1",
+            "description": "Resultado con imagen",
+            "accountCode": "401010100000",
+            "files": (BytesIO(b"fake-image"), "evidencia.jpg"),
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.cerrar_presupuesto.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin"}
+        )
+
+    assert status_code == 201
+    stored = mongo_stub.db.documentos.find_one({"_id": doc_id})
+    assert stored["status"] == "finished"
+    assert stored["description"] == "Resultado con imagen"
+    assert stored["archivos_aprobado"][0]["nombre"] == "evidencia.jpg"
+
+    other_doc_id = ObjectId()
+    mongo_stub.db.documentos.rows.append({"_id": other_doc_id, "project_id": project_id, "descripcion": "Actividad 2"})
+
+    with app.test_request_context(
+        "/documento_cerrar",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "docId": str(other_doc_id),
+            "monto": "1",
+            "description": "Resultado con PDF",
+            "accountCode": "401010100000",
+            "files": (BytesIO(b"%PDF"), "evidencia.pdf"),
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.cerrar_presupuesto.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin"}
+        )
+
+    assert status_code == 400
+    assert response.get_json()["error"] == "Solo se permiten imágenes PNG, GIF, JPEG o JPG en el cierre de actividad"
 
 
 def test_transfer_between_accounts_actualiza_ambas(monkeypatch):
@@ -890,7 +1140,10 @@ def test_descargar_movimientos_exporta_timeline_json(monkeypatch):
 
     app = create_app()
     with app.test_request_context(f"/proyecto/{project_id}/movimientos/descargar?formato=json"):
-        response = project_routes.descargar_movimientos(str(project_id))
+        response = project_routes.descargar_movimientos.__wrapped__.__wrapped__(
+            {"role": "super_admin"},
+            str(project_id),
+        )
 
     response.direct_passthrough = False
     payload = response.get_data(as_text=True)
