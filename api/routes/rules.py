@@ -33,6 +33,20 @@ def _ensure_project_access(user, project):
         return _forbidden("No autorizado para acceder a este proyecto")
     return None
 
+
+def _resolve_rule_funding_year(data, project):
+    year_value = _pick_value(data, "year", "fundingYear")
+    if year_value in (None, ""):
+        year_value = project.get("fundingYear") or project.get("funding_year")
+
+    if year_value in (None, ""):
+        return datetime.now(timezone.utc).year, None
+
+    try:
+        return int(year_value), None
+    except (TypeError, ValueError):
+        return None, (jsonify({"message": "year inválido"}), 400)
+
 @rules_bp.route("/crear_solicitud_regla_fija", methods=["POST"])
 @token_required
 def crear_solicitud_regla_fija(user):
@@ -209,6 +223,9 @@ def asignar_regla_fija(user):
               type: string
             regla_id:
               type: string
+            year:
+              type: integer
+              description: Año contable del proyecto
     responses:
       200:
         description: Regla asignada
@@ -239,6 +256,10 @@ def asignar_regla_fija(user):
     if access_error:
         return access_error
 
+    funding_year, funding_year_error = _resolve_rule_funding_year(data, proyecto)
+    if funding_year_error:
+        return funding_year_error
+
     regla = mongo.db.solicitudes.find_one({"_id": regla_object_id})
     if regla is None:
         return jsonify({"message": "Regla fija no encontrada"}), 404
@@ -260,7 +281,11 @@ def asignar_regla_fija(user):
         normalized_items.append({"item": item, "accountCode": account_code, "amountUnits": amount_units})
 
     for account_code, total_amount in grouped_amounts.items():
-        balance = ProjectFundingService._project_balance_for_account(proyecto_id, account_code, year=2025)
+        balance = ProjectFundingService._project_balance_for_account(
+            proyecto_id,
+            account_code,
+            year=funding_year,
+        )
         if (balance - total_amount) < 0:
             return jsonify({"message": f"Saldo insuficiente en la partida {account_code} para aplicar la regla fija"}), 400
 
@@ -271,7 +296,7 @@ def asignar_regla_fija(user):
         try:
             ProjectFundingService.consume_project_account(
                 proyecto,
-                year=2025,
+                year=funding_year,
                 account_code=account_code,
                 amount=amount_units,
                 user=user,
@@ -302,7 +327,7 @@ def asignar_regla_fija(user):
         {"$set": {"regla_fija": {**regla, "accountMappings": account_mappings}, "status": new_status}},
     )
 
-    return jsonify({"message": "La regla se asigno correctamente"}), 200
+    return jsonify({"message": "La regla se asigno correctamente", "year": funding_year}), 200
 
 @rules_bp.route("/mostrar_solicitudes", methods=["GET"])
 @allow_cors

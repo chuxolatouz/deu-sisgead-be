@@ -9,6 +9,7 @@ from api import create_app
 from api.routes import accounting as accounting_routes
 from api.routes import documents as documents_routes
 from api.routes import projects as project_routes
+from api.routes import rules as rules_routes
 from api.services import accounting_service
 from api.services import project_funding_service
 from api.services.accounting_service import AccountCatalogService, AccountScopeService, SeedService
@@ -715,6 +716,65 @@ def test_finalizar_actividad_acepta_imagenes_y_rechaza_archivos_invalidos(monkey
 
     assert status_code == 400
     assert response.get_json()["error"] == "Solo se permiten imágenes PNG, GIF, JPEG o JPG en el cierre de actividad"
+
+
+def test_asignar_regla_fija_usa_el_ano_del_proyecto(monkeypatch):
+    mongo_stub = MongoStub()
+    consumed_years = []
+    checked_years = []
+    monkeypatch.setattr(rules_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(rules_routes, "can_access_project", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(rules_routes, "actualizar_pasos", lambda status, _step: (status, []))
+    monkeypatch.setattr(
+        rules_routes.ProjectFundingService,
+        "_project_balance_for_account",
+        lambda *_args, **kwargs: checked_years.append(kwargs["year"]) or 9999,
+    )
+    monkeypatch.setattr(
+        rules_routes.ProjectFundingService,
+        "consume_project_account",
+        lambda *args, **kwargs: consumed_years.append(kwargs["year"]),
+    )
+
+    project_id = ObjectId()
+    rule_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append(
+        {
+            "_id": project_id,
+            "departamento_id": ObjectId(),
+            "nombre": "Proyecto reglas",
+            "fundingYear": 2026,
+            "status": {"completado": []},
+        }
+    )
+    mongo_stub.db.solicitudes = InMemoryCollection()
+    mongo_stub.db.solicitudes.rows.append(
+        {
+            "_id": rule_id,
+            "nombre": "Regla anual",
+            "reglas": [{"nombre_regla": "Pago unico", "monto": 2500}],
+        }
+    )
+
+    app = create_app()
+    with app.test_request_context(
+        "/asignar_regla_fija/",
+        method="POST",
+        json={
+            "projectId": str(project_id),
+            "ruleId": str(rule_id),
+            "year": 2026,
+            "accountMappings": [{"itemIndex": 0, "accountCode": "401010100000"}],
+        },
+    ):
+        response, status_code = rules_routes.asignar_regla_fija.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin"}
+        )
+
+    assert status_code == 200
+    assert response.get_json()["year"] == 2026
+    assert checked_years == [2026]
+    assert consumed_years == [2026]
 
 
 def test_transfer_between_accounts_actualiza_ambas(monkeypatch):
