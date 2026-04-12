@@ -676,6 +676,8 @@ class ProjectFundingService:
         budgets = list(
             mongo.db.documentos.find({"$or": [{"project_id": project["_id"]}, {"proyecto_id": project["_id"]}]})
         )
+        new_activities = [item for item in budgets if item.get("status") == "new"]
+        administrative_closed_activities = [item for item in budgets if item.get("status") == "in_progress"]
         finished_budgets = [item for item in budgets if item.get("status") == "finished"]
 
         return {
@@ -684,8 +686,12 @@ class ProjectFundingService:
             "resumen": {
                 "ingresos": round(ingresos, 2),
                 "egresos": round(egresos, 2),
+                "actividades_totales": len(budgets),
+                "actividades_nuevas": len(new_activities),
+                "actividades_cierre_administrativo": len(administrative_closed_activities),
+                "actividades_finalizadas": len(finished_budgets),
                 "presupuestos": len(finished_budgets),
-                "represupuestos": len([item for item in budgets if item.get("status") != "finished"]),
+                "represupuestos": len(new_activities) + len(administrative_closed_activities),
                 "miembros": len(project.get("miembros") or []),
             },
             "saldo_inicial": summary["totals"]["initialAssigned"],

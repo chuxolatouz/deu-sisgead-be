@@ -12,11 +12,17 @@ from api.util.common import agregar_log
 from api.util.utils import string_to_int, int_to_string
 from api.util.backblaze import upload_file
 from api.services.project_funding_service import ProjectFundingService
-from api.util.access import can_access_project, parse_object_id
+from api.util.access import (
+    can_access_project,
+    is_admin_departamento,
+    is_super_admin,
+    parse_object_id,
+)
 
 documents_bp = Blueprint('documents', __name__)
 ALLOWED_RESULT_IMAGE_EXTENSIONS = {".png", ".gif", ".jpeg", ".jpg"}
 ALLOWED_RESULT_IMAGE_MIME_PREFIX = "image/"
+VALID_ACTIVITY_STATUSES = {"new", "in_progress", "finished"}
 
 
 def _pick_form_value(*keys):
@@ -49,6 +55,50 @@ def _with_result_attachment_links(doc_id, attachments):
             item["download_url"] = f"/documentos/{doc_id}/resultados/{index}"
         output.append(item)
     return output
+
+
+def _result_text(documento):
+    return str(
+        documento.get("resultados")
+        or documento.get("description")
+        or ""
+    ).strip()
+
+
+def _ensure_administrative_close_access(user):
+    if is_super_admin(user) or is_admin_departamento(user):
+        return None
+    return _forbidden("Solo super_admin o admin_departamento pueden realizar el cierre administrativo")
+
+
+def _resolve_activity_funding_year(project):
+    year_value = _pick_form_value("year", "fundingYear")
+    if year_value in (None, ""):
+        year_value = project.get("fundingYear") or project.get("funding_year")
+
+    if year_value in (None, ""):
+        return datetime.now(timezone.utc).year, None
+
+    try:
+        return int(year_value), None
+    except (TypeError, ValueError):
+        return None, (jsonify({"error": "year inválido"}), 400)
+
+
+def _save_result_files(project_id, doc_id, files):
+    project_folder = os.path.join("files", str(project_id))
+    result_folder = os.path.join(project_folder, str(doc_id), "resultados")
+    os.makedirs(result_folder, exist_ok=True)
+
+    attachments = []
+    for archivo in files:
+        if not archivo or not (archivo.filename or "").strip():
+            continue
+        file_name = archivo.filename
+        file_path = os.path.join(result_folder, file_name)
+        archivo.save(file_path)
+        attachments.append({"nombre": file_name, "ruta": file_path})
+    return attachments
 
 
 def _forbidden(message="No autorizado"):
@@ -103,7 +153,7 @@ def mostrar_documentos_proyecto(user, id):
                     type: integer
                   status:
                     type: string
-                    enum: [new, finished]
+                    enum: [new, in_progress, finished]
             count:
               type: integer
     """
@@ -124,8 +174,13 @@ def mostrar_documentos_proyecto(user, id):
     limit = int(params.get("limit")) if params.get("limit") else 10
     status = (params.get("status") or "").strip().lower()
     skip = page * limit  # Calcular skip basado en page y limit
-    query = {"project_id": project_object_id}
-    if status in {"new", "finished"}:
+    query = {
+        "$or": [
+            {"project_id": project_object_id},
+            {"proyecto_id": project_object_id},
+        ]
+    }
+    if status in VALID_ACTIVITY_STATUSES:
         query["status"] = status
 
     documentos = mongo.db.documentos.find(query).skip(skip).limit(limit)
@@ -147,7 +202,17 @@ def mostrar_documentos_proyecto(user, id):
             documento["transferAmount"] = documento.get("monto_transferencia")
         if "cuenta_contable" in documento:
             documento["accountCode"] = documento.get("cuenta_contable")
-        documento["resultDescription"] = documento.get("description")
+        documento["resultados"] = _result_text(documento)
+        documento["resultDescription"] = documento.get("resultados")
+        documento["logros"] = documento.get("logros") or ""
+        documento["limitaciones"] = documento.get("limitaciones") or ""
+        documento["lecciones"] = documento.get("lecciones") or ""
+        documento["lineas_accion"] = documento.get("lineas_accion") or ""
+        documento["lineasAccion"] = documento.get("lineas_accion") or ""
+        if "administrative_closed_at" in documento:
+            documento["administrativeClosedAt"] = documento.get("administrative_closed_at")
+        if "finalized_at" in documento:
+            documento["finalizedAt"] = documento.get("finalized_at")
         documento["resultAttachments"] = _with_result_attachment_links(
             documento.get("_id", {}).get("$oid"),
             documento.get("archivos_aprobado", []),
@@ -305,7 +370,7 @@ def crear_presupuesto(user):
 @token_required
 def cerrar_presupuesto(user):
     """
-    Cerrar actividad con aprobación
+    Registrar cierre administrativo de actividad
     ---
     tags:
       - Actividades
@@ -329,9 +394,6 @@ def cerrar_presupuesto(user):
         required: true
         description: Monto aprobado
       - in: formData
-        name: description
-        type: string
-      - in: formData
         name: referencia
         type: string
       - in: formData
@@ -344,11 +406,12 @@ def cerrar_presupuesto(user):
         name: cuenta_contable
         type: string
       - in: formData
-        name: files
-        type: file
+        name: year
+        type: integer
+        description: Año contable del proyecto
     responses:
       201:
-        description: Actividad cerrada
+        description: Cierre administrativo registrado
       400:
         description: Monto excede saldo disponible
     """
@@ -356,10 +419,6 @@ def cerrar_presupuesto(user):
     doc_id = _pick_form_value("docId", "doc_id")
     data_balance = request.form.get("monto")
     data_descripcion = (_pick_form_value("description", "descripcion") or "").strip()
-    
-    # Note: Local file storage code was present in original but mixed with DB updates
-    # I kept the logic structure but note that 'files' folder might be ephemeral in some deployments.
-    carpeta_proyecto = os.path.join("files", id)
     referencia = request.form.get("referencia")
     monto_transferencia = _pick_form_value("transferAmount", "monto_transferencia")
     banco = (request.form.get("banco") or "").strip()
@@ -369,8 +428,6 @@ def cerrar_presupuesto(user):
         return jsonify({"error": "projectId, docId y monto son requeridos"}), 400
     if not cuenta_contable:
         return jsonify({"error": "accountCode es requerido"}), 400
-    if not data_descripcion:
-        return jsonify({"error": "description es requerido"}), 400
 
     project_object_id = parse_object_id(id)
     if not project_object_id:
@@ -380,9 +437,164 @@ def cerrar_presupuesto(user):
     if not documento_object_id:
         return jsonify({"error": "docId inválido"}), 400
 
-    if not os.path.exists(carpeta_proyecto):
-        os.makedirs(carpeta_proyecto)
-        
+    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
+    if not proyecto:
+        return jsonify({"error": "Proyecto no encontrado"}), 404
+
+    access_error = _ensure_project_access(user, proyecto)
+    if access_error:
+        return access_error
+
+    funding_year, funding_year_error = _resolve_activity_funding_year(proyecto)
+    if funding_year_error:
+        return funding_year_error
+
+    admin_access_error = _ensure_administrative_close_access(user)
+    if admin_access_error:
+        return admin_access_error
+
+    documento = mongo.db.documentos.find_one({"_id": documento_object_id})
+    if not documento:
+        return jsonify({"error": "Actividad no encontrada"}), 404
+
+    documento_project_id = parse_object_id(documento.get("project_id") or documento.get("proyecto_id"))
+    if not documento_project_id or str(documento_project_id) != str(project_object_id):
+        return jsonify({"error": "La actividad no pertenece al proyecto indicado"}), 400
+
+    current_status = (documento.get("status") or "new").strip().lower()
+    if current_status == "in_progress":
+        return jsonify({"error": "La actividad ya tiene un cierre administrativo registrado"}), 400
+    if current_status == "finished":
+        return jsonify({"error": "La actividad ya está finalizada"}), 400
+    if current_status != "new":
+        return jsonify({"error": "La actividad no se encuentra en un estado válido para cierre administrativo"}), 400
+
+    data_balance_int = string_to_int(data_balance)
+    amount_units = round(data_balance_int / 100, 2)
+    accounting_description = data_descripcion or documento.get("descripcion") or f"Consumo de actividad {doc_id}"
+
+    try:
+        actor_name = user.get("nombre", "Usuario")
+        ProjectFundingService.consume_project_account(
+            proyecto,
+            year=funding_year,
+            account_code=cuenta_contable,
+            amount=amount_units,
+            user=user,
+            description=accounting_description,
+            reference={
+                "kind": "project_expense",
+                "budgetId": str(doc_id),
+                "projectId": str(id),
+                "actorName": actor_name,
+                "title": "Consumo por actividad",
+                "accountCode": cuenta_contable,
+                "referenceNumber": referencia,
+                "bank": banco,
+                "transferAmount": monto_transferencia,
+            },
+            allow_negative=False,
+            log_message=(
+                f'{actor_name} registro el cierre administrativo de la actividad {documento.get("descripcion", "")} '
+                f'por Bs. {int_to_string(data_balance_int)} '
+                f'imputando la partida {cuenta_contable}'
+            ),
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    mongo.db.documentos.update_one(
+        {"_id": documento_object_id},
+        {
+            "$set": {
+                "status": "in_progress",
+                "monto_aprobado": data_balance_int,
+                "referencia": referencia,
+                "monto_transferencia": monto_transferencia,
+                "transferAmount": monto_transferencia,
+                "banco": banco,
+                "cuenta_contable": cuenta_contable,
+                "accountCode": cuenta_contable,
+                "administrative_closed_at": datetime.utcnow(),
+            }
+        },
+    )
+
+    return jsonify({"mensaje": "Cierre administrativo registrado exitosamente", "year": funding_year}), 201
+
+
+@documents_bp.route("/documento_finalizar", methods=["POST"])
+@allow_cors
+@token_required
+def finalizar_actividad(user):
+    """
+    Finalizar actividad con resultados e imágenes
+    ---
+    tags:
+      - Actividades
+    security:
+      - Bearer: []
+    consumes:
+      - multipart/form-data
+    parameters:
+      - in: formData
+        name: proyecto_id
+        type: string
+        required: true
+      - in: formData
+        name: doc_id
+        type: string
+        required: true
+      - in: formData
+        name: resultados
+        type: string
+        required: true
+      - in: formData
+        name: logros
+        type: string
+      - in: formData
+        name: limitaciones
+        type: string
+      - in: formData
+        name: lecciones
+        type: string
+      - in: formData
+        name: lineas_accion
+        type: string
+      - in: formData
+        name: files
+        type: file
+    responses:
+      201:
+        description: Actividad finalizada
+    """
+    id = _pick_form_value("projectId", "project_id", "proyecto_id")
+    doc_id = _pick_form_value("docId", "doc_id")
+    resultados = (
+        _pick_form_value("resultados", "resultDescription", "description", "descripcion")
+        or ""
+    ).strip()
+    logros = (_pick_form_value("logros") or "").strip()
+    limitaciones = (_pick_form_value("limitaciones") or "").strip()
+    lecciones = (_pick_form_value("lecciones") or "").strip()
+    lineas_accion = (
+        _pick_form_value("lineasAccion", "lineas_accion")
+        or ""
+    ).strip()
+
+    if not id or not doc_id:
+        return jsonify({"error": "projectId y docId son requeridos"}), 400
+    if not resultados:
+        return jsonify({"error": "resultados es requerido"}), 400
+
+    project_object_id = parse_object_id(id)
+    if not project_object_id:
+        return jsonify({"error": "projectId inválido"}), 400
+
+    documento_object_id = parse_object_id(doc_id)
+    if not documento_object_id:
+        return jsonify({"error": "docId inválido"}), 400
+
     proyecto = mongo.db.proyectos.find_one({"_id": project_object_id})
     if not proyecto:
         return jsonify({"error": "Proyecto no encontrado"}), 404
@@ -399,6 +611,14 @@ def cerrar_presupuesto(user):
     if not documento_project_id or str(documento_project_id) != str(project_object_id):
         return jsonify({"error": "La actividad no pertenece al proyecto indicado"}), 400
 
+    current_status = (documento.get("status") or "new").strip().lower()
+    if current_status == "new":
+        return jsonify({"error": "La actividad debe pasar por cierre administrativo antes de finalizarse"}), 400
+    if current_status == "finished":
+        return jsonify({"error": "La actividad ya está finalizada"}), 400
+    if current_status != "in_progress":
+        return jsonify({"error": "La actividad no se encuentra en un estado válido para finalizarse"}), 400
+
     archivos = request.files.getlist("files")
     invalid_files = [
         archivo.filename
@@ -408,74 +628,31 @@ def cerrar_presupuesto(user):
     if invalid_files:
         return jsonify({"error": "Solo se permiten imágenes PNG, GIF, JPEG o JPG en el cierre de actividad"}), 400
 
-    data_balance_int = string_to_int(data_balance)
-    amount_units = round(data_balance_int / 100, 2)
-
-    try:
-        actor_name = user.get("nombre", "Usuario")
-        ProjectFundingService.consume_project_account(
-            proyecto,
-            year=2025,
-            account_code=cuenta_contable,
-            amount=amount_units,
-            user=user,
-            description=data_descripcion or f"Consumo de actividad {doc_id}",
-            reference={
-                "kind": "project_expense",
-                "budgetId": str(doc_id),
-                "projectId": str(id),
-                "actorName": actor_name,
-                "title": "Consumo por actividad",
-                "accountCode": cuenta_contable,
-                "referenceNumber": referencia,
-                "bank": banco,
-                "transferAmount": monto_transferencia,
-            },
-            allow_negative=False,
-            log_message=(
-                f'{actor_name} cerro la actividad {data_descripcion} por Bs. {int_to_string(data_balance_int)} '
-                f'imputando la partida {cuenta_contable}'
-            ),
-        )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
-
-    archivos_guardados = []
-    
-    for archivo in archivos:
-        nombre_archivo = archivo.filename
-        presupuesto_id = str(ObjectId())
-        carpeta_presupuesto = os.path.join(carpeta_proyecto, presupuesto_id)
-        if not os.path.exists(carpeta_presupuesto):
-             os.makedirs(carpeta_presupuesto)
-        
-        archivo.save(os.path.join(carpeta_presupuesto, nombre_archivo))
-        archivos_guardados.append(
-            {
-                "nombre": nombre_archivo,
-                "ruta": os.path.join(carpeta_presupuesto, nombre_archivo),
-            }
-        )
+    archivos_guardados = _save_result_files(id, doc_id, archivos)
 
     mongo.db.documentos.update_one(
         {"_id": documento_object_id},
         {
             "$set": {
                 "status": "finished",
-                "monto_aprobado": data_balance_int,
+                "resultados": resultados,
+                "description": resultados,
+                "logros": logros,
+                "limitaciones": limitaciones,
+                "lecciones": lecciones,
+                "lineas_accion": lineas_accion,
                 "archivos_aprobado": archivos_guardados,
-                "description": data_descripcion,
-                "referencia": referencia,
-                "monto_transferencia": monto_transferencia,
-                "transferAmount": monto_transferencia,
-                "banco": banco,
-                "cuenta_contable": cuenta_contable,
-                "accountCode": cuenta_contable
+                "finalized_at": datetime.utcnow(),
             }
         },
     )
 
-    return jsonify({"mensaje": "proyecto ajustado exitosamente"}), 201
+    agregar_log(
+        id,
+        f'{user.get("nombre", "Usuario")} finalizo la actividad {documento.get("descripcion", "")}',
+    )
+
+    return jsonify({"mensaje": "Actividad finalizada exitosamente"}), 201
 
 @documents_bp.route("/eliminar_presupuesto", methods=["POST"])
 @documents_bp.route("/documento_eliminar", methods=["POST"])
@@ -538,8 +715,8 @@ def eliminar_presupuesto_route(user):
     if access_error:
         return access_error
 
-    if documento["status"] == "finished":
-        return jsonify({"mensaje": "Actividad esta finalizada, no se puede eliminar"}), 401
+    if (documento.get("status") or "new") != "new":
+        return jsonify({"mensaje": "Solo se pueden eliminar actividades en estado nuevo"}), 401
     
     result = mongo.db.documentos.delete_one({"_id": presupuesto_object_id})
     if result.deleted_count == 1:

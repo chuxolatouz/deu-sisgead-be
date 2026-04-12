@@ -26,7 +26,7 @@ class Config:
         'title': 'DEU SISGEAD API',
         'uiversion': 3,
         'version': '1.0.0',
-        'description': 'API REST para el Sistema de Gestión Administrativa de Proyectos, Presupuestos, Usuarios y Departamentos',
+        'description': 'API REST para el Sistema de Gestión Administrativa de Proyectos, Actividades, Usuarios y Departamentos',
         'termsOfService': '',
         'hide_top_bar': False,
         'specs_route': '/apidocs/',

@@ -64,18 +64,33 @@ def generar_reporte_proyecto(user, proyecto_id):
             saldo_restante:
               type: integer
               description: Saldo restante en centavos
+            actividades_totales:
+              type: integer
+              description: Cantidad total de actividades
             presupuestos_totales:
               type: integer
-              description: Cantidad total de presupuestos
+              description: Clave legacy equivalente a actividades_totales
             monto_total_presupuestado:
               type: integer
               description: Monto total presupuestado en centavos
             monto_total_aprobado:
               type: integer
               description: Monto total aprobado en centavos
+            top_actividades:
+              type: array
+              description: Top 5 actividades finalizadas por monto aprobado
+              items:
+                type: object
+                properties:
+                  descripcion:
+                    type: string
+                  monto_aprobado:
+                    type: integer
+                  objetivo_especifico:
+                    type: string
             top_presupuestos:
               type: array
-              description: Top 5 presupuestos aprobados
+              description: Clave legacy equivalente a top_actividades
               items:
                 type: object
                 properties:
@@ -116,6 +131,9 @@ def generar_reporte_proyecto(user, proyecto_id):
     monto_total_presupuestado = sum(p.get("monto", 0) for p in presupuestos)
     monto_total_aprobado = sum(p.get("monto_aprobado", 0) for p in presupuestos if p.get("status") == "finished")
     presupuestos_totales = len(presupuestos)
+    actividades_nuevas = len([p for p in presupuestos if p.get("status") == "new"])
+    actividades_cierre_administrativo = len([p for p in presupuestos if p.get("status") == "in_progress"])
+    actividades_finalizadas = len([p for p in presupuestos if p.get("status") == "finished"])
 
     top_presupuestos = sorted(
         [p for p in presupuestos if p.get("status") == "finished"],
@@ -135,6 +153,11 @@ def generar_reporte_proyecto(user, proyecto_id):
     reporte = {
         "saldo_inicial": saldo_inicial,
         "saldo_restante": saldo_restante,
+        "actividades_totales": presupuestos_totales,
+        "actividades_nuevas": actividades_nuevas,
+        "actividades_cierre_administrativo": actividades_cierre_administrativo,
+        "actividades_finalizadas": actividades_finalizadas,
+        "top_actividades": top_presupuestos_simple,
         "presupuestos_totales": presupuestos_totales,
         "monto_total_presupuestado": monto_total_presupuestado,
         "monto_total_aprobado": monto_total_aprobado,
@@ -308,23 +331,22 @@ def dashboard_global(user):
     total_miembros = len(miembros_set)
 
     # Presupuestos
-    total_presupuestos = mongo.db.documentos.count_documents({
+    documents_scope_query = {
         "$or": [
             {"project_id": {"$in": project_ids}},
             {"proyecto_id": {"$in": project_ids}},
         ]
-    })
-    total_presupuestos_finalizados = mongo.db.documentos.count_documents({
-        "$and": [
-            {
-                "$or": [
-                    {"project_id": {"$in": project_ids}},
-                    {"proyecto_id": {"$in": project_ids}},
-                ]
-            },
-            {"status": "finished"},
-        ]
-    })
+    }
+    total_presupuestos = mongo.db.documentos.count_documents(documents_scope_query)
+    total_presupuestos_nuevos = mongo.db.documentos.count_documents(
+        {"$and": [documents_scope_query, {"status": "new"}]}
+    )
+    total_presupuestos_cierre_administrativo = mongo.db.documentos.count_documents(
+        {"$and": [documents_scope_query, {"status": "in_progress"}]}
+    )
+    total_presupuestos_finalizados = mongo.db.documentos.count_documents(
+        {"$and": [documents_scope_query, {"status": "finished"}]}
+    )
 
     # Ocurrencias (Participation in top projects)
     user_counts = defaultdict(int)
@@ -408,6 +430,9 @@ def dashboard_global(user):
             "proyectos": total_proyectos,
             "miembros": total_miembros,
             "presupuestos": total_presupuestos,
+            "actividades_nuevas": total_presupuestos_nuevos,
+            "actividades_cierre_administrativo": total_presupuestos_cierre_administrativo,
+            "actividades_finalizadas": total_presupuestos_finalizados,
             "presupuestos_finalizados": total_presupuestos_finalizados,
             "ocurrencias": ocurrencias
         },

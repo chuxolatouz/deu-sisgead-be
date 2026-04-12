@@ -1,13 +1,15 @@
 import unittest
 from datetime import datetime, timezone
 from io import BytesIO
-from api.index import db_documentos
 from api.index import app
+from api.extensions import mongo
 
 class ActividadTestCase(unittest.TestCase):
     def setUp(self):
         self.client = app.test_client()
         self.client.testing = True
+        self.app_context = app.app_context()
+        self.app_context.push()
 
         # Crear usuario y obtener token
         self.user = {
@@ -41,6 +43,10 @@ class ActividadTestCase(unittest.TestCase):
             "proyecto_id": self.proyecto_id,
             "balance": 10000
         }, headers=self.auth_headers)
+        self.funding_year = datetime.now(timezone.utc).year
+
+    def tearDown(self):
+        self.app_context.pop()
 
     def test_01_crear_actividad(self):
         actividad = {
@@ -86,9 +92,6 @@ class ActividadTestCase(unittest.TestCase):
         )
         self.assertEqual(res.status_code, 201)
 
-        data = res.get_json()
-        
-        
         balance = {
             "project_id": self.proyecto_id,
             "balance": "1000",
@@ -100,7 +103,7 @@ class ActividadTestCase(unittest.TestCase):
         # Buscar el doc_id de la actividad recién creada
         
 
-        doc = db_documentos.find_one({"descripcion": "Actividad para cerrar"})
+        doc = mongo.db.documentos.find_one({"descripcion": "Actividad para cerrar"})
         self.assertIsNotNone(doc)
         doc_id = str(doc["_id"])
 
@@ -108,20 +111,16 @@ class ActividadTestCase(unittest.TestCase):
             "proyecto_id": self.proyecto_id,
             "doc_id": doc_id,
             "monto": "1",
-            "description": "Cierre automático por test",
+            "year": str(self.funding_year),
             "referencia": "REF12345",
             "monto_transferencia": "1",
             "banco": "TestBank",
-            "cuenta_contable": "CC123456789"
-        }
-
-        file_data = {
-            "files": (BytesIO(b"archivo cierre"), "cierre.pdf")
+            "cuenta_contable": "401010100000"
         }
 
         res = self.client.post(
             "/documento_cerrar",
-            data={**cerrar_data, **file_data},
+            data=cerrar_data,
             headers=self.auth_headers,
             content_type='multipart/form-data'
         )
@@ -129,7 +128,28 @@ class ActividadTestCase(unittest.TestCase):
         self.assertEqual(res.status_code, 201)
         data = res.get_json()
         self.assertIn("mensaje", data)
-        self.assertEqual(data["mensaje"], "proyecto ajustado exitosamente")
+        self.assertEqual(data["mensaje"], "Cierre administrativo registrado exitosamente")
+
+        res = self.client.post(
+            "/documento_finalizar",
+            data={
+                "proyecto_id": self.proyecto_id,
+                "doc_id": doc_id,
+                "resultados": "Resultados finales por test",
+                "logros": "Logros por test",
+                "limitaciones": "Limitaciones por test",
+                "lecciones": "Lecciones por test",
+                "lineas_accion": "Lineas por test",
+                "files": (BytesIO(b"fake-image"), "evidencia.jpg"),
+            },
+            headers=self.auth_headers,
+            content_type='multipart/form-data'
+        )
+        print("Response from finalizar actividad:", res.get_json())
+        self.assertEqual(res.status_code, 201)
+        data = res.get_json()
+        self.assertIn("mensaje", data)
+        self.assertEqual(data["mensaje"], "Actividad finalizada exitosamente")
 
 
     def test_03_cerrar_actividad_erroneo(self):
@@ -151,7 +171,7 @@ class ActividadTestCase(unittest.TestCase):
         # Buscar el doc_id de la actividad recién creada
         
 
-        doc = db_documentos.find_one({"descripcion": "Actividad para cerrar"})
+        doc = mongo.db.documentos.find_one({"descripcion": "Actividad para cerrar"})
         self.assertIsNotNone(doc)
         doc_id = str(doc["_id"])
 
@@ -159,20 +179,16 @@ class ActividadTestCase(unittest.TestCase):
             "proyecto_id": self.proyecto_id,
             "doc_id": doc_id,
             "monto": "500.00",
-            "description": "Cierre automático por test",
+            "year": str(self.funding_year),
             "referencia": "REF12345",
             "monto_transferencia": "500.00",
             "banco": "TestBank",
-            "cuenta_contable": "CC123456789"
-        }
-
-        file_data = {
-            "files": (BytesIO(b"archivo cierre"), "cierre.pdf")
+            "cuenta_contable": "401010100000"
         }
 
         res = self.client.post(
             "/documento_cerrar",
-            data={**cerrar_data, **file_data},
+            data=cerrar_data,
             headers=self.auth_headers,
             content_type='multipart/form-data'
         )

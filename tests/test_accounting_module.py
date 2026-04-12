@@ -59,9 +59,18 @@ class InMemoryCollection:
         return current == expected
 
     def _match(self, row, query):
+        clauses = []
         if "$or" in query:
-            return any(self._match(row, branch) for branch in query["$or"])
-        return all(self._match_condition(self._resolve_field(row, k), v) for k, v in query.items())
+            clauses.append(any(self._match(row, branch) for branch in query["$or"]))
+        if "$and" in query:
+            clauses.append(all(self._match(row, branch) for branch in query["$and"]))
+
+        for key, value in query.items():
+            if key in {"$or", "$and"}:
+                continue
+            clauses.append(self._match_condition(self._resolve_field(row, key), value))
+
+        return all(clauses) if clauses else True
 
     def bulk_write(self, ops, ordered=False):
         upserted = 0
@@ -501,7 +510,15 @@ def test_mostrar_documentos_resultados_expone_aliases_y_filtro(monkeypatch):
                 "descripcion": "Actividad finalizada",
                 "status": "finished",
                 "description": "Resultado final",
+                "logros": "Logro 1",
+                "lineas_accion": "Seguir trabajando",
                 "archivos_aprobado": [{"nombre": "resultado.jpg", "ruta": "/tmp/resultado.jpg"}],
+            },
+            {
+                "_id": ObjectId(),
+                "project_id": project_id,
+                "descripcion": "Actividad con cierre administrativo",
+                "status": "in_progress",
             },
             {
                 "_id": ObjectId(),
@@ -521,19 +538,29 @@ def test_mostrar_documentos_resultados_expone_aliases_y_filtro(monkeypatch):
     assert len(payload["request_list"]) == 1
     result = payload["request_list"][0]
     assert result["resultDescription"] == "Resultado final"
+    assert result["resultados"] == "Resultado final"
+    assert result["logros"] == "Logro 1"
+    assert result["lineasAccion"] == "Seguir trabajando"
     assert result["resultAttachments"][0]["download_url"].endswith(f"/documentos/{finished_doc_id}/resultados/0")
 
 
-def test_cerrar_presupuesto_acepta_imagenes_y_rechaza_archivos_invalidos(monkeypatch, tmp_path):
+def test_cerrar_presupuesto_registra_cierre_administrativo_y_restringe_permisos(monkeypatch, tmp_path):
     mongo_stub = MongoStub()
+    consumed = {}
     monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
     monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(documents_routes.ProjectFundingService, "consume_project_account", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        documents_routes.ProjectFundingService,
+        "consume_project_account",
+        lambda *args, **kwargs: consumed.update(kwargs),
+    )
     monkeypatch.chdir(tmp_path)
 
     project_id = ObjectId()
     doc_id = ObjectId()
-    mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId(), "nombre": "Proyecto"})
+    mongo_stub.db.proyectos.rows.append(
+        {"_id": project_id, "departamento_id": ObjectId(), "nombre": "Proyecto", "fundingYear": 2026}
+    )
     mongo_stub.db.documentos.rows.append({"_id": doc_id, "project_id": project_id, "descripcion": "Actividad"})
 
     app = create_app()
@@ -545,9 +572,11 @@ def test_cerrar_presupuesto_acepta_imagenes_y_rechaza_archivos_invalidos(monkeyp
             "projectId": str(project_id),
             "docId": str(doc_id),
             "monto": "1",
-            "description": "Resultado con imagen",
+            "year": "2026",
+            "referencia": "REF-01",
+            "transferAmount": "1",
+            "banco": "Banco prueba",
             "accountCode": "401010100000",
-            "files": (BytesIO(b"fake-image"), "evidencia.jpg"),
         },
         content_type="multipart/form-data",
     ):
@@ -557,28 +586,131 @@ def test_cerrar_presupuesto_acepta_imagenes_y_rechaza_archivos_invalidos(monkeyp
 
     assert status_code == 201
     stored = mongo_stub.db.documentos.find_one({"_id": doc_id})
-    assert stored["status"] == "finished"
-    assert stored["description"] == "Resultado con imagen"
-    assert stored["archivos_aprobado"][0]["nombre"] == "evidencia.jpg"
-
-    other_doc_id = ObjectId()
-    mongo_stub.db.documentos.rows.append({"_id": other_doc_id, "project_id": project_id, "descripcion": "Actividad 2"})
+    assert stored["status"] == "in_progress"
+    assert stored["monto_aprobado"] == 100
+    assert stored["accountCode"] == "401010100000"
+    assert stored["referencia"] == "REF-01"
+    assert stored["administrative_closed_at"] is not None
+    assert consumed["year"] == 2026
 
     with app.test_request_context(
         "/documento_cerrar",
         method="POST",
         data={
             "projectId": str(project_id),
-            "docId": str(other_doc_id),
+            "docId": str(doc_id),
             "monto": "1",
-            "description": "Resultado con PDF",
+            "year": "2026",
             "accountCode": "401010100000",
-            "files": (BytesIO(b"%PDF"), "evidencia.pdf"),
         },
         content_type="multipart/form-data",
     ):
         response, status_code = documents_routes.cerrar_presupuesto.__wrapped__.__wrapped__(
-            {"role": "super_admin", "nombre": "Admin"}
+            {"role": "usuario", "nombre": "Usuario"}
+        )
+
+    assert status_code == 403
+    assert "cierre administrativo" in response.get_json()["message"]
+
+
+def test_finalizar_actividad_acepta_imagenes_y_rechaza_archivos_invalidos(monkeypatch, tmp_path):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+    monkeypatch.chdir(tmp_path)
+
+    project_id = ObjectId()
+    doc_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId(), "nombre": "Proyecto"})
+    mongo_stub.db.documentos.rows.append(
+        {
+            "_id": doc_id,
+            "project_id": project_id,
+            "descripcion": "Actividad",
+            "status": "in_progress",
+        }
+    )
+
+    app = create_app()
+
+    with app.test_request_context(
+        "/documento_finalizar",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "docId": str(doc_id),
+            "resultados": "Resultado con imagen",
+            "logros": "Logro principal",
+            "limitaciones": "Limitacion principal",
+            "lecciones": "Leccion principal",
+            "lineasAccion": "Siguiente paso",
+            "files": (BytesIO(b"fake-image"), "evidencia.jpg"),
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.finalizar_actividad.__wrapped__.__wrapped__(
+            {"role": "usuario", "nombre": "Admin"}
+        )
+
+    assert status_code == 201
+    stored = mongo_stub.db.documentos.find_one({"_id": doc_id})
+    assert stored["status"] == "finished"
+    assert stored["resultados"] == "Resultado con imagen"
+    assert stored["description"] == "Resultado con imagen"
+    assert stored["logros"] == "Logro principal"
+    assert stored["lineas_accion"] == "Siguiente paso"
+    assert stored["archivos_aprobado"][0]["nombre"] == "evidencia.jpg"
+
+    new_doc_id = ObjectId()
+    mongo_stub.db.documentos.rows.append(
+        {
+            "_id": new_doc_id,
+            "project_id": project_id,
+            "descripcion": "Actividad nueva",
+            "status": "new",
+        }
+    )
+
+    with app.test_request_context(
+        "/documento_finalizar",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "docId": str(new_doc_id),
+            "resultados": "Resultado invalido",
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.finalizar_actividad.__wrapped__.__wrapped__(
+            {"role": "usuario", "nombre": "Admin"}
+        )
+
+    assert status_code == 400
+    assert "cierre administrativo" in response.get_json()["error"]
+
+    other_doc_id = ObjectId()
+    mongo_stub.db.documentos.rows.append(
+        {
+            "_id": other_doc_id,
+            "project_id": project_id,
+            "descripcion": "Actividad 2",
+            "status": "in_progress",
+        }
+    )
+
+    with app.test_request_context(
+        "/documento_finalizar",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "docId": str(other_doc_id),
+            "resultados": "Resultado con PDF",
+            "files": (BytesIO(b"%PDF"), "evidencia.pdf"),
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.finalizar_actividad.__wrapped__.__wrapped__(
+            {"role": "usuario", "nombre": "Admin"}
         )
 
     assert status_code == 400
