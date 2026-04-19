@@ -1,9 +1,14 @@
+from datetime import datetime, timedelta, timezone
+import secrets
+import string
+
 from flask import Blueprint, request, jsonify, current_app
 from jose import jwt
 from api.extensions import mongo, bcrypt
 from api.util.utils import generar_token
-from api.util.decorators import validar_datos
+from api.util.decorators import token_required, validar_datos
 from api.config import Config
+from api.routes.notifications import send_email_notification_thread
 from api.util.access import (
     ROLE_ADMIN_DEPARTAMENTO,
     ROLE_SUPER_ADMIN,
@@ -18,6 +23,51 @@ from api.util.access import (
 )
 
 auth_bp = Blueprint('auth', __name__)
+TEMPORARY_PASSWORD_TTL_HOURS = 2
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _is_expired(value):
+    if not value:
+        return False
+    if isinstance(value, dict) and "$date" in value:
+        value = value["$date"]
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return False
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value < _utc_now()
+    return False
+
+
+def _generate_temporary_password(length=12):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(length))
+
+
+def _send_temporary_password_email(usuario, temporary_password, expires_at):
+    expires_label = expires_at.astimezone(timezone.utc).strftime("%d/%m/%Y %H:%M UTC")
+    body = f"""
+    <p>Hola {usuario.get("nombre", "Usuario")},</p>
+    <p>Se generó una contraseña temporal para ingresar a DEU SISGEAD.</p>
+    <p><strong>Contraseña temporal:</strong> {temporary_password}</p>
+    <p>Esta contraseña vence el {expires_label}. Al iniciar sesión deberás crear una contraseña nueva.</p>
+    <p>Si no solicitaste este cambio, comunícate con el administrador del sistema.</p>
+    """
+    send_email_notification_thread(
+        app=current_app._get_current_object(),
+        subject="Recuperación de contraseña DEU",
+        recipient=usuario["email"],
+        body=body,
+        is_html=True,
+    )
 
 
 def _actor_from_request():
@@ -206,6 +256,12 @@ def login():
     usuario = db_usuarios.find_one({"email": data["email"]})
     
     if usuario and bcrypt.check_password_hash(usuario["password"], data["password"]):
+        must_change_password = bool(usuario.get("mustChangePassword"))
+        if must_change_password and _is_expired(usuario.get("temporaryPasswordExpiresAt")):
+            return jsonify({
+                "message": "La contraseña temporal expiró. Solicita una nueva recuperación de contraseña."
+            }), 403
+
         token = generar_token(usuario, Config.SECRET_KEY)
 
         if "rol" in usuario:
@@ -221,6 +277,7 @@ def login():
             "id": str(usuario["_id"]),
             "nombre": usuario["nombre"],
             "role": role,
+            "mustChangePassword": must_change_password,
         }
         
         user_department_id = usuario.get("departmentId") or usuario.get("departamento_id")
@@ -271,11 +328,65 @@ def olvido_contraseña():
               type: string
               example: "El email electrónico no está registrado"
     """
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
+    if not data.get("email"):
+        return jsonify({"message": "El email es requerido"}), 400
+
     db_usuarios = mongo.db.usuarios
     usuario = db_usuarios.find_one({"email": data["email"]})
-    if usuario:
-        # TODO: Implementar envío real de correo
-        return jsonify({"message": "Se ha enviado un email electrónico para restablecer la contraseña"}), 200
-    else:
+    if not usuario:
         return jsonify({"message": "El email electrónico no está registrado"}), 404
+
+    temporary_password = _generate_temporary_password()
+    expires_at = _utc_now() + timedelta(hours=TEMPORARY_PASSWORD_TTL_HOURS)
+    db_usuarios.update_one(
+        {"_id": usuario["_id"]},
+        {
+            "$set": {
+                "password": bcrypt.generate_password_hash(temporary_password).decode("utf-8"),
+                "mustChangePassword": True,
+                "temporaryPasswordExpiresAt": expires_at,
+            }
+        },
+    )
+
+    usuario = {**usuario, "password": temporary_password}
+    _send_temporary_password_email(usuario, temporary_password, expires_at)
+    return jsonify({"message": "Se ha enviado un email electrónico para restablecer la contraseña"}), 200
+
+
+@auth_bp.route("/change-password", methods=["POST"])
+@token_required
+def change_password(user):
+    data = request.get_json(silent=True) or {}
+    current_password = data.get("currentPassword") or data.get("current_password")
+    new_password = data.get("newPassword") or data.get("new_password") or data.get("password")
+
+    if not current_password or not new_password:
+        return jsonify({"message": "currentPassword y newPassword son requeridos"}), 400
+    if len(str(new_password)) < 6:
+        return jsonify({"message": "La nueva contraseña debe tener al menos 6 caracteres"}), 400
+
+    db_usuarios = mongo.db.usuarios
+    usuario = db_usuarios.find_one({"email": user.get("email")})
+    if not usuario:
+        return jsonify({"message": "Usuario no encontrado"}), 404
+    if not bcrypt.check_password_hash(usuario["password"], current_password):
+        return jsonify({"message": "La contraseña actual no es válida"}), 401
+    if usuario.get("mustChangePassword") and _is_expired(usuario.get("temporaryPasswordExpiresAt")):
+        return jsonify({
+            "message": "La contraseña temporal expiró. Solicita una nueva recuperación de contraseña."
+        }), 403
+
+    db_usuarios.update_one(
+        {"_id": usuario["_id"]},
+        {
+            "$set": {
+                "password": bcrypt.generate_password_hash(new_password).decode("utf-8"),
+                "mustChangePassword": False,
+                "temporaryPasswordExpiresAt": None,
+                "passwordChangedAt": _utc_now(),
+            }
+        },
+    )
+    return jsonify({"message": "Contraseña actualizada con éxito"}), 200

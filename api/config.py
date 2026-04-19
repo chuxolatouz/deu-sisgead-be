@@ -11,6 +11,7 @@ load_dotenv(_backend_root / ".env")
 class Config:
     SECRET_KEY = os.getenv("SECRET_KEY", "dev_key_fallback")
     MONGO_URI = os.getenv("MONGODB_URI", "mongodb://localhost:27017/enii")
+    SPONSORED_ACTIVITY_ACCOUNT_CODE = os.getenv("SPONSORED_ACTIVITY_ACCOUNT_CODE", "").strip()
     
     # Mail Config
     MAIL_SERVER = os.getenv("SMTP_SERVER", "smtp.gmail.com")
