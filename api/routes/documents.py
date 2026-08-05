@@ -68,6 +68,36 @@ def _coerce_bool(value, default=False):
     return str(value).strip().lower() in {"1", "true", "yes", "si", "on"}
 
 
+def _normalize_specific_objectives(value):
+    if value in (None, ""):
+        return []
+
+    parsed = value
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("objetivos_especificos debe ser un arreglo JSON válido") from exc
+
+    values = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+    normalized = []
+    for objective in values:
+        text = str(objective or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
+
+
+def _validate_activity_objectives(project, objectives):
+    project_objectives = _normalize_specific_objectives(project.get("objetivos_especificos"))
+    if not project_objectives:
+        return None
+    invalid = [objective for objective in objectives if objective not in project_objectives]
+    if invalid:
+        return f"Objetivos específicos no asociados al proyecto: {', '.join(invalid)}"
+    return None
+
+
 def _is_allowed_result_image(file_storage):
     filename = (getattr(file_storage, "filename", "") or "").strip().lower()
     _, ext = os.path.splitext(filename)
@@ -206,8 +236,16 @@ def _decorate_activity_document(documento):
     elif project_id:
         documento["projectId"] = str(project_id)
 
-    if "objetivo_especifico" in documento:
-        documento["specificObjective"] = documento.get("objetivo_especifico")
+    raw_objectives = (
+        documento.get("objetivos_especificos")
+        if "objetivos_especificos" in documento
+        else documento.get("objetivo_especifico")
+    )
+    specific_objectives = _normalize_specific_objectives(raw_objectives)
+    documento["objetivos_especificos"] = specific_objectives
+    documento["specificObjectives"] = specific_objectives
+    documento["objetivo_especifico"] = specific_objectives[0] if specific_objectives else ""
+    documento["specificObjective"] = documento["objetivo_especifico"]
     if "monto_transferencia" in documento:
         documento["transferAmount"] = documento.get("monto_transferencia")
     if "cuenta_contable" in documento:
@@ -246,8 +284,11 @@ def _decorate_activity_document(documento):
         "closed": sum(1 for item in decorated_items if item.get("status") == ITEM_CLOSED_STATUS),
         "pending": sum(1 for item in decorated_items if item.get("status") != ITEM_CLOSED_STATUS),
     }
+    document_id = documento.get("_id")
+    if isinstance(document_id, dict):
+        document_id = document_id.get("$oid")
     documento["resultAttachments"] = _with_result_attachment_links(
-        documento.get("_id", {}).get("$oid") or documento.get("_id"),
+        document_id,
         documento.get("archivos_aprobado", []),
     )
     return documento
@@ -598,8 +639,9 @@ def crear_presupuesto(user):
         required: true
         description: Monto en formato string (ej. "1000.00")
       - in: formData
-        name: objetivo_especifico
+        name: objetivos_especificos
         type: string
+        description: Arreglo JSON de objetivos específicos
       - in: formData
         name: files
         type: file
@@ -620,7 +662,17 @@ def crear_presupuesto(user):
     project_id = _pick_form_value("projectId", "project_id", "proyecto_id")
     descripcion = request.form.get("descripcion")
     monto = request.form.get("monto")
-    objetivo_especifico = _pick_form_value("specificObjective", "objetivo_especifico")
+    raw_objectives = _pick_form_value(
+        "specificObjectives",
+        "objetivosEspecificos",
+        "objetivos_especificos",
+        "specificObjective",
+        "objetivo_especifico",
+    )
+    try:
+        objetivos_especificos = _normalize_specific_objectives(raw_objectives)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
     patrocinada = _coerce_bool(_pick_form_value("patrocinada", "isSponsored"), default=False)
     try:
         items = _parse_activity_items_from_form()
@@ -634,13 +686,20 @@ def crear_presupuesto(user):
     if not project_object_id:
         return jsonify({"error": "projectId inválido"}), 400
 
-    proyecto = mongo.db.proyectos.find_one({"_id": project_object_id}, {"departamento_id": 1})
+    proyecto = mongo.db.proyectos.find_one(
+        {"_id": project_object_id},
+        {"departamento_id": 1, "objetivos_especificos": 1},
+    )
     if not proyecto:
         return jsonify({"error": "Proyecto no encontrado"}), 404
 
     access_error = _ensure_project_access(user, proyecto)
     if access_error:
         return access_error
+
+    objectives_error = _validate_activity_objectives(proyecto, objetivos_especificos)
+    if objectives_error:
+        return jsonify({"error": objectives_error}), 400
         
     presupuesto_id = str(ObjectId())
 
@@ -652,7 +711,8 @@ def crear_presupuesto(user):
         "descripcion": descripcion,
         "monto": presupuesto_monto,
         "status": "new",
-        "objetivo_especifico": objetivo_especifico,
+        "objetivos_especificos": objetivos_especificos,
+        "objetivo_especifico": objetivos_especificos[0] if objetivos_especificos else "",
         "patrocinada": patrocinada,
         "items": items,
         "archivos": [],
@@ -704,9 +764,24 @@ def editar_actividad(user, doc_id):
     update_data = {}
     if "descripcion" in data:
         update_data["descripcion"] = str(data.get("descripcion") or "").strip()
-    objective = _pick_mapping_value(data, "specificObjective", "objetivo_especifico")
-    if objective is not None:
-        update_data["objetivo_especifico"] = objective
+    objective_keys = (
+        "specificObjectives",
+        "objetivosEspecificos",
+        "objetivos_especificos",
+        "specificObjective",
+        "objetivo_especifico",
+    )
+    if any(key in data for key in objective_keys):
+        raw_objectives = next(data.get(key) for key in objective_keys if key in data)
+        try:
+            objetivos_especificos = _normalize_specific_objectives(raw_objectives)
+        except ValueError as exc:
+            return jsonify({"message": str(exc)}), 400
+        objectives_error = _validate_activity_objectives(proyecto, objetivos_especificos)
+        if objectives_error:
+            return jsonify({"message": objectives_error}), 400
+        update_data["objetivos_especificos"] = objetivos_especificos
+        update_data["objetivo_especifico"] = objetivos_especificos[0] if objetivos_especificos else ""
     if "patrocinada" in data or "isSponsored" in data:
         update_data["patrocinada"] = _coerce_bool(_pick_mapping_value(data, "patrocinada", "isSponsored"))
     if ("monto" in data or "amount" in data) and not _activity_has_real_items(documento):

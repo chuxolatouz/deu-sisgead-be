@@ -152,3 +152,20 @@ def can_access_project(user: Dict[str, Any], project: Optional[Dict[str, Any]]) 
 
     user_dep = user_department_id(user)
     return bool(user_dep and user_dep == target_department_id)
+
+
+def user_id(user: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not user:
+        return None
+    return object_id_to_str(user.get("sub") or user.get("_id") or user.get("id"))
+
+
+def can_edit_project(user: Dict[str, Any], project: Optional[Dict[str, Any]]) -> bool:
+    if not project:
+        return False
+    if is_super_admin(user):
+        return True
+
+    actor_id = user_id(user)
+    owner_id = object_id_to_str(project.get("owner"))
+    return bool(actor_id and owner_id and actor_id == owner_id)

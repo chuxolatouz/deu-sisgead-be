@@ -14,6 +14,7 @@ from api.util.backblaze import upload_file
 from api.services.project_funding_service import ProjectFundingService
 from api.util.access import (
     can_access_project,
+    can_edit_project,
     is_super_admin,
     parse_object_id,
     user_department_id,
@@ -139,6 +140,18 @@ def _normalize_project_payload(data):
         if source_key in data:
             data.pop(source_key, None)
     return data
+
+
+def _normalize_project_objectives(value):
+    if value is None:
+        return []
+    values = value if isinstance(value, list) else [value]
+    normalized = []
+    for objective in values:
+        text = str(objective or "").strip()
+        if text and text not in normalized:
+            normalized.append(text)
+    return normalized
 
 
 def _get_project_or_404(project_id):
@@ -346,7 +359,6 @@ def crear_proyecto(user):
 
 @projects_bp.route("/actualizar_proyecto/<project_id>", methods=["PUT"])
 @token_required
-@validar_datos({"nombre": str, "descripcion": str})
 def actualizar_proyecto(user, project_id):
     """
     Actualizar proyecto
@@ -385,9 +397,32 @@ def actualizar_proyecto(user, project_id):
     if not project:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    access_error = _ensure_project_access(user, project)
-    if access_error:
-        return access_error
+    if not can_edit_project(user, project):
+        return _forbidden("Solo el propietario o un super administrador puede editar el proyecto")
+
+    editable_fields = {
+        "nombre",
+        "descripcion",
+        "fecha_inicio",
+        "fecha_fin",
+        "objetivo_general",
+        "objetivos_especificos",
+        "categoria",
+        "departamento_id",
+    }
+    data = {key: value for key, value in data.items() if key in editable_fields}
+
+    for required_text_field in ("nombre", "descripcion"):
+        if required_text_field in data:
+            normalized_value = str(data.get(required_text_field) or "").strip()
+            if not normalized_value:
+                return jsonify({"message": f"El campo '{required_text_field}' no puede estar vacío"}), 400
+            data[required_text_field] = normalized_value
+
+    if "objetivo_general" in data:
+        data["objetivo_general"] = str(data.get("objetivo_general") or "").strip()
+    if "objetivos_especificos" in data:
+        data["objetivos_especificos"] = _normalize_project_objectives(data.get("objetivos_especificos"))
 
     if "departamento_id" in data:
         if not is_super_admin(user):
@@ -808,6 +843,8 @@ def mostrar_proyectos(user):
         ProjectFundingService.decorate_project(project, year=funding_year, user=user)
         for project in list(list_verification_request)
     ]
+    for project in list_cursor:
+        project["canEdit"] = can_edit_project(user, project)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump)
     _attach_project_department_metadata(list_json)
@@ -961,6 +998,7 @@ def proyecto(user, id):
         return year_error
 
     proyecto = ProjectFundingService.decorate_project(proyecto, year=funding_year, user=user)
+    proyecto["canEdit"] = can_edit_project(user, proyecto)
     proyecto_dump = json_util.dumps(proyecto, default=json_util.default, ensure_ascii=False)
     proyecto_json = json.loads(proyecto_dump)
 

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from io import BytesIO
 from types import SimpleNamespace
+import json
 
 from bson import ObjectId
 from pymongo import UpdateOne
@@ -310,6 +311,75 @@ def test_mostrar_proyectos_incluye_metadata_departamento(monkeypatch):
     assert project["departmentCode"] == "DEP-01"
     assert project["departamento"]["_id"] == str(department_id)
     assert project["departamento"]["nombre"] == "Planificacion"
+    assert project["canEdit"] is True
+
+
+def test_actualizar_proyecto_permite_owner_y_super_admin(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(project_routes, "agregar_log", lambda *_args, **_kwargs: None)
+
+    project_id = ObjectId()
+    owner_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append(
+        {
+            "_id": project_id,
+            "owner": owner_id,
+            "nombre": "Proyecto original",
+            "descripcion": "Descripcion original",
+            "status": {"actual": 2, "completado": [1]},
+        }
+    )
+
+    app = create_app()
+    with app.test_request_context(
+        f"/actualizar_proyecto/{project_id}",
+        method="PUT",
+        json={
+            "nombre": "Proyecto editado por owner",
+            "objetivoGeneral": "Objetivo general actualizado",
+            "objetivosEspecificos": ["Objetivo A", "Objetivo A", "Objetivo B"],
+            "status": {"finished": True},
+        },
+    ):
+        response, status_code = project_routes.actualizar_proyecto.__wrapped__(
+            {"sub": str(owner_id), "role": "usuario", "nombre": "Owner"},
+            str(project_id),
+        )
+
+    assert status_code == 200
+    stored = mongo_stub.db.proyectos.find_one({"_id": project_id})
+    assert stored["nombre"] == "Proyecto editado por owner"
+    assert stored["objetivo_general"] == "Objetivo general actualizado"
+    assert stored["objetivos_especificos"] == ["Objetivo A", "Objetivo B"]
+    assert stored["status"] == {"actual": 2, "completado": [1]}
+
+    with app.test_request_context(
+        f"/actualizar_proyecto/{project_id}",
+        method="PUT",
+        json={"nombre": "Intento no autorizado"},
+    ):
+        response, status_code = project_routes.actualizar_proyecto.__wrapped__(
+            {"sub": str(ObjectId()), "role": "usuario", "nombre": "Otro"},
+            str(project_id),
+        )
+
+    assert status_code == 403
+    assert "propietario" in response.get_json()["message"]
+
+    with app.test_request_context(
+        f"/actualizar_proyecto/{project_id}",
+        method="PUT",
+        json={"nombre": "Proyecto editado por super admin"},
+    ):
+        response, status_code = project_routes.actualizar_proyecto.__wrapped__(
+            {"sub": str(ObjectId()), "role": "super_admin", "nombre": "Super Admin"},
+            str(project_id),
+        )
+
+    assert status_code == 200
+    stored = mongo_stub.db.proyectos.find_one({"_id": project_id})
+    assert stored["nombre"] == "Proyecto editado por super admin"
 
 
 def test_mostrar_proyectos_usa_anio_actual_para_balance(monkeypatch):
@@ -576,6 +646,93 @@ def test_crear_actividad_patrocinada_persiste_campo(monkeypatch):
     assert status_code == 201
     stored = mongo_stub.db.documentos.find_one({"descripcion": "Actividad patrocinada"})
     assert stored["patrocinada"] is True
+
+
+def test_actividad_admite_varios_objetivos_especificos(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(documents_routes, "agregar_log", lambda *_args, **_kwargs: None)
+
+    project_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append(
+        {
+            "_id": project_id,
+            "departamento_id": ObjectId(),
+            "objetivos_especificos": ["Objetivo A", "Objetivo B", "Objetivo C"],
+        }
+    )
+
+    app = create_app()
+    with app.test_request_context(
+        "/documento_crear",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "descripcion": "Actividad con objetivos múltiples",
+            "monto": "100",
+            "specificObjectives": json.dumps(["Objetivo A", "Objetivo B", "Objetivo A"]),
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.crear_presupuesto.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin"}
+        )
+
+    assert status_code == 201
+    stored = mongo_stub.db.documentos.find_one({"descripcion": "Actividad con objetivos múltiples"})
+    assert stored["objetivos_especificos"] == ["Objetivo A", "Objetivo B"]
+    assert stored["objetivo_especifico"] == "Objetivo A"
+
+    decorated = documents_routes._decorate_activity_document(dict(stored))
+    assert decorated["specificObjectives"] == ["Objetivo A", "Objetivo B"]
+    assert decorated["specificObjective"] == "Objetivo A"
+
+
+def test_editar_actividad_actualiza_objetivos_y_mantiene_legacy(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+
+    project_id = ObjectId()
+    document_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append(
+        {
+            "_id": project_id,
+            "departamento_id": ObjectId(),
+            "objetivos_especificos": ["Objetivo A", "Objetivo B"],
+        }
+    )
+    mongo_stub.db.documentos.rows.append(
+        {
+            "_id": document_id,
+            "project_id": project_id,
+            "descripcion": "Actividad legacy",
+            "objetivo_especifico": "Objetivo A",
+            "status": "new",
+        }
+    )
+
+    legacy = documents_routes._decorate_activity_document(
+        dict(mongo_stub.db.documentos.rows[0])
+    )
+    assert legacy["specificObjectives"] == ["Objetivo A"]
+
+    app = create_app()
+    with app.test_request_context(
+        f"/documentos/{document_id}",
+        method="PUT",
+        json={"specificObjectives": ["Objetivo A", "Objetivo B"]},
+    ):
+        response, status_code = documents_routes.editar_actividad.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin"},
+            str(document_id),
+        )
+
+    assert status_code == 200
+    stored = mongo_stub.db.documentos.find_one({"_id": document_id})
+    assert stored["objetivos_especificos"] == ["Objetivo A", "Objetivo B"]
+    assert stored["objetivo_especifico"] == "Objetivo A"
 
 
 def test_cerrar_presupuesto_registra_cierre_administrativo_y_restringe_permisos(monkeypatch, tmp_path):
