@@ -628,6 +628,7 @@ def test_crear_actividad_patrocinada_persiste_campo(monkeypatch):
     mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId()})
 
     app = create_app()
+    app.config["SPONSORED_ACTIVITY_ACCOUNT_CODE"] = "499999999999"
     with app.test_request_context(
         "/documento_crear",
         method="POST",
@@ -646,6 +647,61 @@ def test_crear_actividad_patrocinada_persiste_campo(monkeypatch):
     assert status_code == 201
     stored = mongo_stub.db.documentos.find_one({"descripcion": "Actividad patrocinada"})
     assert stored["patrocinada"] is True
+
+
+def test_crear_actividad_patrocinada_requiere_cuenta_configurada(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+
+    project_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId()})
+
+    app = create_app()
+    app.config["SPONSORED_ACTIVITY_ACCOUNT_CODE"] = ""
+    with app.test_request_context(
+        "/documento_crear",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "descripcion": "Actividad patrocinada inválida",
+            "monto": "0",
+            "patrocinada": "true",
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.crear_presupuesto.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin"}
+        )
+
+    assert status_code == 400
+    assert "cuenta de patrocinio" in response.get_json()["error"]
+    assert mongo_stub.db.documentos.rows == []
+
+
+def test_configuracion_actividades_expone_disponibilidad_patrocinio():
+    app = create_app()
+    app.config["SPONSORED_ACTIVITY_ACCOUNT_CODE"] = ""
+    with app.test_request_context("/actividades/configuracion"):
+        response, status_code = documents_routes.configuracion_actividades.__wrapped__.__wrapped__({"role": "usuario"})
+    assert status_code == 200
+    assert response.get_json() == {"sponsoredEnabled": False}
+
+    app.config["SPONSORED_ACTIVITY_ACCOUNT_CODE"] = "499999999999"
+    with app.test_request_context("/actividades/configuracion"):
+        response, status_code = documents_routes.configuracion_actividades.__wrapped__.__wrapped__({"role": "usuario"})
+    assert status_code == 200
+    assert response.get_json() == {"sponsoredEnabled": True}
+
+
+def test_validacion_item_monto_cero_y_cuenta():
+    assert documents_routes._validate_activity_item({"monto": 0, "accountCode": ""}) is None
+    assert "monto 0" in documents_routes._validate_activity_item(
+        {"monto": 0, "accountCode": "401010100000"}
+    )
+    assert "cuenta asociada" in documents_routes._validate_activity_item(
+        {"monto": 100, "accountCode": ""}
+    )
 
 
 def test_actividad_admite_varios_objetivos_especificos(monkeypatch):
@@ -997,6 +1053,95 @@ def test_actividad_items_cierre_parcial_y_cierre_pendientes(monkeypatch, tmp_pat
     assert consumed[1]["amount"] == 200
 
 
+def test_cierre_item_cero_sin_cuenta_no_consume_y_guarda_respaldo(monkeypatch):
+    mongo_stub = MongoStub()
+    consumed = []
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(documents_routes, "agregar_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        documents_routes.ProjectFundingService,
+        "consume_project_account",
+        lambda *args, **kwargs: consumed.append(kwargs),
+    )
+
+    project_id = ObjectId()
+    doc_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append(
+        {"_id": project_id, "departamento_id": ObjectId(), "fundingYear": 2026}
+    )
+    mongo_stub.db.documentos.rows.append({
+        "_id": doc_id,
+        "project_id": project_id,
+        "descripcion": "Actividad sin gasto",
+        "status": "new",
+        "items": [{"id": "item-0", "nombre": "Gestión interna", "monto": 0, "accountCode": "", "status": "pending"}],
+    })
+
+    app = create_app()
+    with app.test_request_context(
+        f"/documentos/{doc_id}/items/item-0/cierre-administrativo",
+        method="POST",
+        data={
+            "year": "2026",
+            "referencia": "SIN-GASTO",
+            "supportFiles": (BytesIO(b"%PDF respaldo"), "respaldo.pdf"),
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.cerrar_item_actividad.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin", "sub": "u1"},
+            str(doc_id),
+            "item-0",
+        )
+
+    assert status_code == 201
+    assert response.get_json()["status"] == "in_progress"
+    assert consumed == []
+    stored = mongo_stub.db.documentos.find_one({"_id": doc_id})
+    assert stored["items"][0]["accountCode"] == ""
+    assert stored["items"][0]["montoAprobado"] == 0
+    attachment = stored["administrativeAttachments"][0]
+    assert attachment["nombre"] == "respaldo.pdf"
+    assert attachment["relatedItemIds"] == ["item-0"]
+    assert attachment["download_url"].startswith("https://files.example.test/")
+
+
+def test_fallo_respaldo_no_cierra_item(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(documents_routes, "upload_file", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("storage down")))
+
+    project_id = ObjectId()
+    doc_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId(), "fundingYear": 2026})
+    mongo_stub.db.documentos.rows.append({
+        "_id": doc_id,
+        "project_id": project_id,
+        "descripcion": "Actividad",
+        "status": "new",
+        "items": [{"id": "item-1", "nombre": "Item", "monto": 0, "accountCode": "", "status": "pending"}],
+    })
+
+    app = create_app()
+    with app.test_request_context(
+        f"/documentos/{doc_id}/items/item-1/cierre-administrativo",
+        method="POST",
+        data={"year": "2026", "supportFiles": (BytesIO(b"fake"), "evidencia.jpg")},
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.cerrar_item_actividad.__wrapped__.__wrapped__(
+            {"role": "super_admin", "nombre": "Admin"}, str(doc_id), "item-1"
+        )
+
+    assert status_code == 502
+    assert "respaldos" in response.get_json()["error"]
+    stored = mongo_stub.db.documentos.find_one({"_id": doc_id})
+    assert stored["status"] == "new"
+    assert stored["items"][0]["status"] == "pending"
+
+
 def test_finalizar_actividad_con_items_pendientes_falla(monkeypatch, tmp_path):
     mongo_stub = MongoStub()
     monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
@@ -1133,6 +1278,8 @@ def test_finalizar_actividad_acepta_imagenes_y_rechaza_archivos_invalidos(monkey
     assert stored["logros"] == "Logro principal"
     assert stored["lineas_accion"] == "Siguiente paso"
     assert stored["archivos_aprobado"][0]["nombre"] == "evidencia.jpg"
+    assert stored["archivos_aprobado"][0]["download_url"].startswith("https://files.example.test/")
+    assert "ruta" not in stored["archivos_aprobado"][0]
 
     new_doc_id = ObjectId()
     mongo_stub.db.documentos.rows.append(
@@ -1187,7 +1334,44 @@ def test_finalizar_actividad_acepta_imagenes_y_rechaza_archivos_invalidos(monkey
         )
 
     assert status_code == 400
-    assert response.get_json()["error"] == "Solo se permiten imágenes PNG, GIF, JPEG o JPG en el cierre de actividad"
+    assert response.get_json()["error"] == "Solo se permiten imágenes PNG, GIF, JPEG o JPG"
+
+
+def test_fallo_evidencia_remota_no_finaliza_actividad(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(documents_routes, "upload_file", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("storage down")))
+
+    project_id = ObjectId()
+    doc_id = ObjectId()
+    mongo_stub.db.proyectos.rows.append({"_id": project_id, "departamento_id": ObjectId()})
+    mongo_stub.db.documentos.rows.append({
+        "_id": doc_id,
+        "project_id": project_id,
+        "descripcion": "Actividad en progreso",
+        "status": "in_progress",
+    })
+
+    app = create_app()
+    with app.test_request_context(
+        "/documento_finalizar",
+        method="POST",
+        data={
+            "projectId": str(project_id),
+            "docId": str(doc_id),
+            "resultados": "Resultado",
+            "files": (BytesIO(b"fake"), "evidencia.jpg"),
+        },
+        content_type="multipart/form-data",
+    ):
+        response, status_code = documents_routes.finalizar_actividad.__wrapped__.__wrapped__(
+            {"role": "usuario", "nombre": "Usuario"}
+        )
+
+    assert status_code == 502
+    assert "evidencias" in response.get_json()["error"]
+    assert mongo_stub.db.documentos.find_one({"_id": doc_id})["status"] == "in_progress"
 
 
 def test_asignar_regla_fija_usa_el_ano_del_proyecto(monkeypatch):

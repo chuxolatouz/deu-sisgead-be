@@ -5,6 +5,7 @@ import os
 import math
 from datetime import datetime, timezone
 from io import BytesIO
+from werkzeug.utils import secure_filename
 
 from api.extensions import mongo
 from api.util.decorators import token_required, allow_cors
@@ -21,7 +22,9 @@ from api.util.access import (
 
 documents_bp = Blueprint('documents', __name__)
 ALLOWED_RESULT_IMAGE_EXTENSIONS = {".png", ".gif", ".jpeg", ".jpg"}
-ALLOWED_RESULT_IMAGE_MIME_PREFIX = "image/"
+ALLOWED_SUPPORT_EXTENSIONS = ALLOWED_RESULT_IMAGE_EXTENSIONS | {".pdf"}
+MAX_SUPPORT_FILES = 10
+MAX_SUPPORT_FILE_SIZE = 10 * 1024 * 1024
 VALID_ACTIVITY_STATUSES = {"new", "partial_admin_closed", "in_progress", "finished"}
 ITEM_PENDING_STATUS = "pending"
 ITEM_CLOSED_STATUS = "closed"
@@ -98,11 +101,60 @@ def _validate_activity_objectives(project, objectives):
     return None
 
 
-def _is_allowed_result_image(file_storage):
-    filename = (getattr(file_storage, "filename", "") or "").strip().lower()
-    _, ext = os.path.splitext(filename)
-    mimetype = (getattr(file_storage, "mimetype", "") or "").strip().lower()
-    return ext in ALLOWED_RESULT_IMAGE_EXTENSIONS or mimetype.startswith(ALLOWED_RESULT_IMAGE_MIME_PREFIX)
+def _attachment_bytes(file_storage):
+    file_storage.stream.seek(0)
+    content = file_storage.read(MAX_SUPPORT_FILE_SIZE + 1)
+    file_storage.stream.seek(0)
+    return content
+
+
+def _validate_attachments(files, *, images_only=False):
+    clean_files = [file for file in files or [] if file and (file.filename or "").strip()]
+    if len(clean_files) > MAX_SUPPORT_FILES:
+        return None, f"Solo se permiten hasta {MAX_SUPPORT_FILES} archivos por operación"
+
+    allowed_extensions = ALLOWED_RESULT_IMAGE_EXTENSIONS if images_only else ALLOWED_SUPPORT_EXTENSIONS
+    for file_storage in clean_files:
+        filename = (file_storage.filename or "").strip()
+        _, extension = os.path.splitext(filename.lower())
+        mimetype = (file_storage.mimetype or "").lower()
+        valid_mime = mimetype.startswith("image/") or (not images_only and mimetype == "application/pdf")
+        if extension not in allowed_extensions or not valid_mime:
+            allowed_label = "imágenes PNG, GIF, JPEG o JPG" if images_only else "imágenes PNG, GIF, JPEG, JPG o archivos PDF"
+            return None, f"Solo se permiten {allowed_label}"
+
+        content = _attachment_bytes(file_storage)
+        if len(content) > MAX_SUPPORT_FILE_SIZE:
+            return None, f"El archivo {filename} excede el límite de 10 MB"
+
+    return clean_files, None
+
+
+def _upload_attachments(files, *, base_path, user, closure_id=None, related_item_ids=None):
+    uploaded_at = datetime.utcnow()
+    uploaded_by = {
+        "id": user.get("sub"),
+        "nombre": user.get("nombre", "Usuario"),
+    }
+    attachments = []
+    for file_storage in files:
+        original_name = (file_storage.filename or "archivo").strip()
+        safe_name = secure_filename(original_name) or f"archivo-{ObjectId()}"
+        content = _attachment_bytes(file_storage)
+        storage_name = f"{ObjectId()}-{safe_name}"
+        upload_result = upload_file(BytesIO(content), f"{base_path}/{storage_name}")
+        attachments.append({
+            "nombre": original_name,
+            "public_id": upload_result["fileId"],
+            "download_url": upload_result["download_url"],
+            "contentType": file_storage.mimetype or "application/octet-stream",
+            "size": len(content),
+            "uploadedAt": uploaded_at,
+            "uploadedBy": uploaded_by,
+            **({"closureId": closure_id} if closure_id else {}),
+            **({"relatedItemIds": related_item_ids or []} if closure_id else {}),
+        })
+    return attachments
 
 
 def _with_result_attachment_links(doc_id, attachments):
@@ -167,6 +219,22 @@ def _normalize_activity_item(data, existing=None):
     status = str(existing.get("status") or ITEM_PENDING_STATUS).strip().lower()
     item["status"] = status if status in VALID_ITEM_STATUSES else ITEM_PENDING_STATUS
     return item
+
+
+def _validate_activity_item(item, *, is_sponsored=False):
+    amount = int(item.get("monto") or 0)
+    account_code = str(item.get("accountCode") or item.get("cuenta_contable") or "").strip()
+    if amount < 0:
+        return "El monto del item no puede ser negativo"
+    if is_sponsored:
+        if amount != 0 or account_code:
+            return "Los items patrocinados deben tener monto 0 y no deben tener una cuenta seleccionada"
+        return None
+    if amount == 0 and account_code:
+        return "Un item con monto 0 no puede tener una cuenta asociada"
+    if amount > 0 and not account_code:
+        return "Un item con monto mayor a 0 debe tener una cuenta asociada"
+    return None
 
 
 def _parse_activity_items_from_form():
@@ -291,6 +359,7 @@ def _decorate_activity_document(documento):
         document_id,
         documento.get("archivos_aprobado", []),
     )
+    documento["administrativeAttachments"] = documento.get("administrativeAttachments") or []
     return documento
 
 
@@ -317,22 +386,6 @@ def _resolve_activity_funding_year(project):
         return None, (jsonify({"error": "year inválido"}), 400)
 
 
-def _save_result_files(project_id, doc_id, files):
-    project_folder = os.path.join("files", str(project_id))
-    result_folder = os.path.join(project_folder, str(doc_id), "resultados")
-    os.makedirs(result_folder, exist_ok=True)
-
-    attachments = []
-    for archivo in files:
-        if not archivo or not (archivo.filename or "").strip():
-            continue
-        file_name = archivo.filename
-        file_path = os.path.join(result_folder, file_name)
-        archivo.save(file_path)
-        attachments.append({"nombre": file_name, "ruta": file_path})
-    return attachments
-
-
 def _forbidden(message="No autorizado"):
     return jsonify({"message": message}), 403
 
@@ -341,6 +394,15 @@ def _ensure_project_access(user, project):
     if not can_access_project(user, project):
         return _forbidden("No autorizado para acceder a este proyecto")
     return None
+
+
+@documents_bp.route("/actividades/configuracion", methods=["GET"])
+@allow_cors
+@token_required
+def configuracion_actividades(user):
+    return jsonify({
+        "sponsoredEnabled": bool(_resolve_sponsored_activity_account_code()),
+    }), 200
 
 
 @documents_bp.route("/proyecto/<string:id>/documentos", methods=["GET"])
@@ -486,7 +548,7 @@ def _load_activity_with_project(user, doc_id):
     return documento_object_id, documento, proyecto, None
 
 
-def _close_activity_items(documento, proyecto, user, funding_year, payload=None, item_id=None):
+def _close_activity_items(documento, proyecto, user, funding_year, payload=None, item_id=None, support_files=None):
     payload = payload or {}
     if not _activity_has_real_items(documento):
         return None, (jsonify({"error": "La actividad no tiene items administrativos configurados"}), 400)
@@ -510,7 +572,48 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
     actor_name = user.get("nombre", "Usuario")
     now = datetime.utcnow()
 
-    closed_any = False
+    target_item_ids = [
+        str(item.get("id"))
+        for item in items
+        if (item_id is None or str(item.get("id")) == str(item_id))
+        and item.get("status") != ITEM_CLOSED_STATUS
+    ]
+    if item_id is not None and not any(str(item.get("id")) == str(item_id) for item in items):
+        return None, (jsonify({"error": "Item no encontrado"}), 404)
+    if not target_item_ids:
+        return None, (jsonify({"error": "No hay items pendientes por cerrar"}), 400)
+
+    for item in items:
+        if str(item.get("id")) not in target_item_ids:
+            continue
+        approved_cents = 0 if is_sponsored else int(item.get("monto") or 0)
+        if fallback_amount not in (None, "") and item_id is not None:
+            approved_cents = 0 if is_sponsored else _amount_to_cents(fallback_amount, default=approved_cents)
+        account_code = sponsored_account if is_sponsored else str(
+            item.get("accountCode") or item.get("cuenta_contable") or fallback_account
+        ).strip()
+        if approved_cents < 0:
+            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} no puede tener un monto negativo"}), 400)
+        if not is_sponsored and approved_cents == 0 and account_code:
+            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} con monto 0 no puede tener una cuenta asociada"}), 400)
+        if not is_sponsored and approved_cents > 0 and not account_code:
+            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} requiere una partida asociada"}), 400)
+
+    closure_id = str(ObjectId())
+    uploaded_attachments = []
+    if support_files:
+        try:
+            uploaded_attachments = _upload_attachments(
+                support_files,
+                base_path=f"activities/{proyecto.get('_id')}/{documento.get('_id')}/administrative",
+                user=user,
+                closure_id=closure_id,
+                related_item_ids=target_item_ids,
+            )
+        except Exception as exc:
+            current_app.logger.exception("Error uploading administrative attachments")
+            return None, (jsonify({"error": f"No se pudieron guardar los respaldos: {exc}"}), 502)
+
     updated_items = []
     for item in items:
         matches_item = item_id is None or str(item.get("id")) == str(item_id)
@@ -521,16 +624,17 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
         account_code = sponsored_account if is_sponsored else str(
             item.get("accountCode") or item.get("cuenta_contable") or fallback_account
         ).strip()
-        if not is_sponsored and not account_code:
-            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} requiere una partida asociada"}), 400)
-
         approved_cents = 0 if is_sponsored else int(item.get("monto") or 0)
         if fallback_amount not in (None, "") and item_id is not None:
             approved_cents = 0 if is_sponsored else _amount_to_cents(fallback_amount, default=approved_cents)
-        if not is_sponsored and approved_cents <= 0:
-            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} debe tener un monto mayor a 0"}), 400)
+        if approved_cents < 0:
+            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} no puede tener un monto negativo"}), 400)
+        if not is_sponsored and approved_cents == 0 and account_code:
+            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} con monto 0 no puede tener una cuenta asociada"}), 400)
+        if not is_sponsored and approved_cents > 0 and not account_code:
+            return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} requiere una partida asociada"}), 400)
 
-        if not is_sponsored:
+        if not is_sponsored and approved_cents > 0:
             try:
                 ProjectFundingService.consume_project_account(
                     proyecto,
@@ -560,12 +664,20 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
                 )
             except ValueError as exc:
                 return None, (jsonify({"error": str(exc)}), 400)
-        else:
+        elif is_sponsored:
             agregar_log(
                 proyecto.get("_id"),
                 (
                     f'{actor_name} cerro administrativamente el item patrocinado {item.get("nombre", "")} '
                     f'de la actividad {documento.get("descripcion", "")} usando la cuenta de referencia {account_code}'
+                ),
+            )
+        else:
+            agregar_log(
+                proyecto.get("_id"),
+                (
+                    f'{actor_name} cerro administrativamente el item sin gasto {item.get("nombre", "")} '
+                    f'de la actividad {documento.get("descripcion", "")}'
                 ),
             )
 
@@ -584,13 +696,7 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
                 "closedBy": {"id": user.get("sub"), "nombre": actor_name},
             }
         )
-        closed_any = True
         updated_items.append(item)
-
-    if item_id is not None and not any(str(item.get("id")) == str(item_id) for item in items):
-        return None, (jsonify({"error": "Item no encontrado"}), 404)
-    if not closed_any:
-        return None, (jsonify({"error": "No hay items pendientes por cerrar"}), 400)
 
     new_status = _activity_status_for_items(updated_items)
     total_approved = sum(_item_amount_approved(item) for item in updated_items)
@@ -603,6 +709,10 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
         "cuenta_contable": account_code_summary,
         "accountCode": account_code_summary,
         "patrocinada": is_sponsored,
+        "administrativeAttachments": [
+            *(documento.get("administrativeAttachments") or []),
+            *uploaded_attachments,
+        ],
     }
     if new_status in {"partial_admin_closed", "in_progress"}:
         set_payload["administrative_closed_at"] = documento.get("administrative_closed_at") or now
@@ -682,6 +792,13 @@ def crear_presupuesto(user):
     if not project_id or not descripcion or monto in (None, ""):
         return jsonify({"error": "Missing required fields"}), 400
 
+    try:
+        requested_amount = _amount_to_cents(monto)
+    except (TypeError, ValueError):
+        return jsonify({"error": "monto inválido"}), 400
+    if requested_amount < 0:
+        return jsonify({"error": "El monto de la actividad no puede ser negativo"}), 400
+
     project_object_id = parse_object_id(project_id)
     if not project_object_id:
         return jsonify({"error": "projectId inválido"}), 400
@@ -700,11 +817,20 @@ def crear_presupuesto(user):
     objectives_error = _validate_activity_objectives(proyecto, objetivos_especificos)
     if objectives_error:
         return jsonify({"error": objectives_error}), 400
+
+    if patrocinada and not _resolve_sponsored_activity_account_code():
+        return jsonify({"error": "No hay una cuenta de patrocinio configurada para crear esta actividad"}), 400
+    if patrocinada and requested_amount != 0:
+        return jsonify({"error": "Las actividades patrocinadas deben tener monto 0"}), 400
+    for item in items:
+        item_error = _validate_activity_item(item, is_sponsored=patrocinada)
+        if item_error:
+            return jsonify({"error": item_error}), 400
         
     presupuesto_id = str(ObjectId())
 
     total_items = _activity_total_from_items(items)
-    presupuesto_monto = total_items if items else string_to_int(monto)
+    presupuesto_monto = total_items if items else (0 if patrocinada else requested_amount)
     presupuesto = {
         "project_id": project_object_id,
         "presupuesto_id": presupuesto_id,
@@ -762,6 +888,7 @@ def editar_actividad(user, doc_id):
 
     data = request.get_json(silent=True) or {}
     update_data = {}
+    current_status = (documento.get("status") or "new").strip().lower()
     if "descripcion" in data:
         update_data["descripcion"] = str(data.get("descripcion") or "").strip()
     objective_keys = (
@@ -783,9 +910,28 @@ def editar_actividad(user, doc_id):
         update_data["objetivos_especificos"] = objetivos_especificos
         update_data["objetivo_especifico"] = objetivos_especificos[0] if objetivos_especificos else ""
     if "patrocinada" in data or "isSponsored" in data:
-        update_data["patrocinada"] = _coerce_bool(_pick_mapping_value(data, "patrocinada", "isSponsored"))
+        next_sponsored = _coerce_bool(_pick_mapping_value(data, "patrocinada", "isSponsored"))
+        if next_sponsored != _is_sponsored_activity(documento) and current_status != "new":
+            return jsonify({"message": "No se puede cambiar el patrocinio después de iniciar el cierre administrativo"}), 400
+        if next_sponsored and not _resolve_sponsored_activity_account_code():
+            return jsonify({"message": "No hay una cuenta de patrocinio configurada para esta actividad"}), 400
+        if next_sponsored:
+            for item in documento.get("items") or []:
+                item_error = _validate_activity_item(item, is_sponsored=True)
+                if item_error:
+                    return jsonify({"message": "Para marcar la actividad como patrocinada, sus items deben tener monto 0 y no tener cuentas asociadas"}), 400
+        update_data["patrocinada"] = next_sponsored
     if ("monto" in data or "amount" in data) and not _activity_has_real_items(documento):
-        update_data["monto"] = _amount_to_cents(_pick_mapping_value(data, "monto", "amount"))
+        try:
+            next_amount = _amount_to_cents(_pick_mapping_value(data, "monto", "amount"))
+        except (TypeError, ValueError):
+            return jsonify({"message": "monto inválido"}), 400
+        if next_amount < 0:
+            return jsonify({"message": "El monto de la actividad no puede ser negativo"}), 400
+        next_sponsored = update_data.get("patrocinada", _is_sponsored_activity(documento))
+        if next_sponsored and next_amount != 0:
+            return jsonify({"message": "Las actividades patrocinadas deben tener monto 0"}), 400
+        update_data["monto"] = next_amount
 
     if not update_data:
         return jsonify({"message": "No hay campos válidos para actualizar"}), 400
@@ -808,6 +954,9 @@ def agregar_item_actividad(user, doc_id):
     item = _normalize_activity_item(data)
     if not item["nombre"]:
         return jsonify({"message": "El nombre del item es requerido"}), 400
+    item_error = _validate_activity_item(item, is_sponsored=_is_sponsored_activity(documento))
+    if item_error:
+        return jsonify({"message": item_error}), 400
 
     items = [dict(row) for row in (documento.get("items") or [])] if _activity_has_real_items(documento) else []
     items.append(item)
@@ -843,6 +992,9 @@ def editar_item_actividad(user, doc_id, item_id):
         items[index] = _normalize_activity_item(data, existing=item)
         if not items[index]["nombre"]:
             return jsonify({"message": "El nombre del item es requerido"}), 400
+        item_error = _validate_activity_item(items[index], is_sponsored=_is_sponsored_activity(documento))
+        if item_error:
+            return jsonify({"message": item_error}), 400
         break
 
     if not found:
@@ -900,13 +1052,19 @@ def cerrar_item_actividad(user, doc_id, item_id):
     if funding_year_error:
         return funding_year_error
 
+    payload = request.form.to_dict() if request.form else (request.get_json(silent=True) or {})
+    support_files, files_error = _validate_attachments(request.files.getlist("supportFiles"))
+    if files_error:
+        return jsonify({"error": files_error}), 400
+
     updated_documento, close_error = _close_activity_items(
         documento,
         proyecto,
         user,
         funding_year,
-        payload=request.get_json(silent=True) or {},
+        payload=payload,
         item_id=item_id,
+        support_files=support_files,
     )
     if close_error:
         return close_error
@@ -1011,6 +1169,10 @@ def cerrar_presupuesto(user):
     if current_status == "finished":
         return jsonify({"error": "La actividad ya está finalizada"}), 400
 
+    support_files, files_error = _validate_attachments(request.files.getlist("supportFiles"))
+    if files_error:
+        return jsonify({"error": files_error}), 400
+
     if _activity_has_real_items(documento):
         if current_status not in {"new", "partial_admin_closed", "in_progress"}:
             return jsonify({"error": "La actividad no se encuentra en un estado válido para cierre administrativo"}), 400
@@ -1028,6 +1190,7 @@ def cerrar_presupuesto(user):
             user,
             funding_year,
             payload=payload,
+            support_files=support_files,
         )
         if close_error:
             return close_error
@@ -1052,15 +1215,37 @@ def cerrar_presupuesto(user):
         data_balance = "0"
         monto_transferencia = "0"
         cuenta_contable = cuenta_patrocinio
-    elif not cuenta_contable:
-        return jsonify({"error": "accountCode es requerido"}), 400
+    try:
+        data_balance_int = _amount_to_cents(data_balance)
+    except (TypeError, ValueError):
+        return jsonify({"error": "monto inválido"}), 400
+    if data_balance_int < 0:
+        return jsonify({"error": "El monto aprobado no puede ser negativo"}), 400
+    if not is_sponsored and data_balance_int == 0 and cuenta_contable:
+        return jsonify({"error": "Un cierre con monto 0 no puede tener una cuenta asociada"}), 400
+    if not is_sponsored and data_balance_int > 0 and not cuenta_contable:
+        return jsonify({"error": "accountCode es requerido para un monto mayor a 0"}), 400
 
-    data_balance_int = string_to_int(data_balance)
+    closure_id = str(ObjectId())
+    uploaded_attachments = []
+    if support_files:
+        try:
+            uploaded_attachments = _upload_attachments(
+                support_files,
+                base_path=f"activities/{id}/{doc_id}/administrative",
+                user=user,
+                closure_id=closure_id,
+                related_item_ids=[],
+            )
+        except Exception as exc:
+            current_app.logger.exception("Error uploading administrative attachments")
+            return jsonify({"error": f"No se pudieron guardar los respaldos: {exc}"}), 502
+
     amount_units = round(data_balance_int / 100, 2)
     accounting_description = data_descripcion or documento.get("descripcion") or f"Consumo de actividad {doc_id}"
 
     actor_name = user.get("nombre", "Usuario")
-    if not is_sponsored:
+    if not is_sponsored and data_balance_int > 0:
         try:
             ProjectFundingService.consume_project_account(
                 proyecto,
@@ -1089,13 +1274,18 @@ def cerrar_presupuesto(user):
             )
         except ValueError as exc:
             return jsonify({"error": str(exc)}), 400
-    else:
+    elif is_sponsored:
         agregar_log(
             id,
             (
                 f'{actor_name} registro el cierre administrativo patrocinado de la actividad '
                 f'{documento.get("descripcion", "")} usando la cuenta de referencia {cuenta_contable}'
             ),
+        )
+    else:
+        agregar_log(
+            id,
+            f'{actor_name} registro el cierre administrativo sin gasto de la actividad {documento.get("descripcion", "")}',
         )
 
     mongo.db.documentos.update_one(
@@ -1112,6 +1302,10 @@ def cerrar_presupuesto(user):
                 "accountCode": cuenta_contable,
                 "patrocinada": is_sponsored,
                 "administrative_closed_at": datetime.utcnow(),
+                "administrativeAttachments": [
+                    *(documento.get("administrativeAttachments") or []),
+                    *uploaded_attachments,
+                ],
             }
         },
     )
@@ -1219,16 +1413,18 @@ def finalizar_actividad(user):
         if not items or any(item.get("status") != ITEM_CLOSED_STATUS for item in items):
             return jsonify({"error": "Todos los items deben tener cierre administrativo antes de finalizar la actividad"}), 400
 
-    archivos = request.files.getlist("files")
-    invalid_files = [
-        archivo.filename
-        for archivo in archivos
-        if archivo and (archivo.filename or "").strip() and not _is_allowed_result_image(archivo)
-    ]
-    if invalid_files:
-        return jsonify({"error": "Solo se permiten imágenes PNG, GIF, JPEG o JPG en el cierre de actividad"}), 400
-
-    archivos_guardados = _save_result_files(id, doc_id, archivos)
+    archivos, files_error = _validate_attachments(request.files.getlist("files"), images_only=True)
+    if files_error:
+        return jsonify({"error": files_error}), 400
+    try:
+        archivos_guardados = _upload_attachments(
+            archivos,
+            base_path=f"activities/{id}/{doc_id}/results",
+            user=user,
+        )
+    except Exception as exc:
+        current_app.logger.exception("Error uploading activity result files")
+        return jsonify({"error": f"No se pudieron guardar las evidencias del resultado: {exc}"}), 502
 
     mongo.db.documentos.update_one(
         {"_id": documento_object_id},

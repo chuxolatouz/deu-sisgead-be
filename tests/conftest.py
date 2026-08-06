@@ -1,8 +1,22 @@
 # tests/conftest.py
 import pytest
+from bson import ObjectId
 
 from api.index import app
+from api.routes import documents as documents_routes
 from pymongo import MongoClient
+
+
+@pytest.fixture(autouse=True)
+def mock_backblaze_upload(monkeypatch):
+    def fake_upload(_file_buffer, full_path):
+        return {
+            "fileName": full_path,
+            "download_url": f"https://files.example.test/{full_path}",
+            "fileId": str(ObjectId()),
+        }
+
+    monkeypatch.setattr(documents_routes, "upload_file", fake_upload)
 
 @pytest.fixture
 def test_db():
