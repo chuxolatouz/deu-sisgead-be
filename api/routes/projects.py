@@ -131,6 +131,8 @@ def _normalize_project_payload(data):
         "fechaFin": "fecha_fin",
         "objetivoGeneral": "objetivo_general",
         "objetivosEspecificos": "objetivos_especificos",
+        "materialesNecesarios": "materiales_necesarios",
+        "recursosHumanos": "recursos_humanos",
         "departmentId": "departamento_id",
     }
     for source_key, target_key in alias_map.items():
@@ -152,6 +154,18 @@ def _normalize_project_objectives(value):
         if text and text not in normalized:
             normalized.append(text)
     return normalized
+
+
+def _normalize_project_requirements(data, *, include_defaults=False):
+    requirement_fields = (
+        "materiales_necesarios",
+        "recursos_humanos",
+        "logistica",
+    )
+    for field in requirement_fields:
+        if field in data or include_defaults:
+            data[field] = str(data.get(field) or "").strip()
+    return data
 
 
 def _get_project_or_404(project_id):
@@ -286,6 +300,12 @@ def crear_proyecto(user):
               type: string
             departamento_id:
               type: string
+            materiales_necesarios:
+              type: string
+            recursos_humanos:
+              type: string
+            logistica:
+              type: string
     responses:
       201:
         description: Proyecto creado
@@ -300,7 +320,10 @@ def crear_proyecto(user):
         description: Categoría o departamento no encontrado
     """
     current_user = user["sub"]
-    data = _normalize_project_payload(request.get_json(silent=True) or {})
+    data = _normalize_project_requirements(
+        _normalize_project_payload(request.get_json(silent=True) or {}),
+        include_defaults=True,
+    )
     
     
     departamento_id = None
@@ -381,6 +404,12 @@ def actualizar_proyecto(user, project_id):
               type: string
             descripcion:
               type: string
+            materiales_necesarios:
+              type: string
+            recursos_humanos:
+              type: string
+            logistica:
+              type: string
     responses:
       200:
         description: Proyecto actualizado
@@ -407,6 +436,9 @@ def actualizar_proyecto(user, project_id):
         "fecha_fin",
         "objetivo_general",
         "objetivos_especificos",
+        "materiales_necesarios",
+        "recursos_humanos",
+        "logistica",
         "categoria",
         "departamento_id",
     }
@@ -423,6 +455,7 @@ def actualizar_proyecto(user, project_id):
         data["objetivo_general"] = str(data.get("objetivo_general") or "").strip()
     if "objetivos_especificos" in data:
         data["objetivos_especificos"] = _normalize_project_objectives(data.get("objetivos_especificos"))
+    _normalize_project_requirements(data)
 
     if "departamento_id" in data:
         if not is_super_admin(user):
