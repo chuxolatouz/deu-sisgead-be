@@ -119,6 +119,7 @@ class AccountCatalogService:
         scope_id: Optional[str] = None,
         assigned_only: bool = False,
         include_zero: bool = True,
+        ancestor_code: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         AccountingIndexes.ensure_indexes()
         query: Dict[str, Any] = {"year": int(year)}
@@ -127,6 +128,16 @@ class AccountCatalogService:
         if q:
             safe_q = str(q).strip()
             query["$or"] = [{"code": {"$regex": safe_q}}, {"description": {"$regex": safe_q, "$options": "i"}}]
+
+        descendant_filter = None
+        if ancestor_code:
+            descendant_filter = AccountCatalogService.descendant_codes(
+                year=year,
+                ancestor_code=ancestor_code,
+            )
+            if not descendant_filter:
+                return []
+            query["code"] = {"$in": sorted(descendant_filter)}
 
         states_by_code: Dict[str, Dict[str, Any]] = {}
         if scope_type and scope_id:
@@ -145,6 +156,8 @@ class AccountCatalogService:
                         for code, row in states_by_code.items()
                         if float(row.get("balance", 0) or 0) != 0 or float(row.get("movementsCount", 0) or 0) > 0
                     }
+                if descendant_filter is not None:
+                    visible_codes &= descendant_filter
                 if not visible_codes:
                     return []
                 query["code"] = {"$in": sorted(visible_codes)}
@@ -168,6 +181,31 @@ class AccountCatalogService:
             return enriched
 
         return rows
+
+    @staticmethod
+    def descendant_codes(year: int, ancestor_code: str) -> set[str]:
+        rows = list(
+            mongo.db.master_accounts.find(
+                {"year": int(year)},
+                {"_id": 0, "code": 1, "parent_code": 1},
+            )
+        )
+        children_by_parent: Dict[str, List[str]] = {}
+        for row in rows:
+            parent_code = str(row.get("parent_code") or "").strip()
+            code = str(row.get("code") or "").strip()
+            if parent_code and code:
+                children_by_parent.setdefault(parent_code, []).append(code)
+
+        descendants = set()
+        pending = list(children_by_parent.get(str(ancestor_code or "").strip(), []))
+        while pending:
+            code = pending.pop()
+            if code in descendants:
+                continue
+            descendants.add(code)
+            pending.extend(children_by_parent.get(code, []))
+        return descendants
 
     @staticmethod
     def tree(year: int, group: Optional[str] = None) -> List[Dict[str, Any]]:

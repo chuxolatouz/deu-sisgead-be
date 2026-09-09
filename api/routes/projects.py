@@ -12,6 +12,7 @@ from api.util.utils import string_to_int, int_to_string, int_to_float, actualiza
 from api.util.generar_acta_finalizacion import generar_acta_finalizacion_pdf
 from api.util.backblaze import upload_file
 from api.services.project_funding_service import ProjectFundingService
+from api.services.requirement_service import RequirementCatalogService
 from api.util.access import (
     can_access_project,
     can_edit_project,
@@ -133,6 +134,7 @@ def _normalize_project_payload(data):
         "objetivosEspecificos": "objetivos_especificos",
         "materialesNecesarios": "materiales_necesarios",
         "recursosHumanos": "recursos_humanos",
+        "requirementIds": "requerimientos",
         "departmentId": "departamento_id",
     }
     for source_key, target_key in alias_map.items():
@@ -360,6 +362,15 @@ def crear_proyecto(user):
     data["owner"] = ObjectId(current_user)
     data["user"] = user
     data["fundingModel"] = ProjectFundingService.ensure_model({"balance": 0, "balance_inicial": 0}, persist=False)
+
+    assignment_year = int(data.get("fundingYear") or datetime.now(timezone.utc).year)
+    project_requirements, requirements_error = RequirementCatalogService.resolve_for_project(
+        data.get("requerimientos", []),
+        year=assignment_year,
+    )
+    if requirements_error:
+        return jsonify({"message": requirements_error}), 400
+    data["requerimientos"] = project_requirements
     
     if departamento_id:
         data["departamento_id"] = departamento_id
@@ -439,6 +450,7 @@ def actualizar_proyecto(user, project_id):
         "materiales_necesarios",
         "recursos_humanos",
         "logistica",
+        "requerimientos",
         "categoria",
         "departamento_id",
     }
@@ -456,6 +468,17 @@ def actualizar_proyecto(user, project_id):
     if "objetivos_especificos" in data:
         data["objetivos_especificos"] = _normalize_project_objectives(data.get("objetivos_especificos"))
     _normalize_project_requirements(data)
+    if "requerimientos" in data:
+        current_requirement_ids = RequirementCatalogService.project_requirement_ids(project)
+        assignment_year = int(project.get("fundingYear") or datetime.now(timezone.utc).year)
+        project_requirements, requirements_error = RequirementCatalogService.resolve_for_project(
+            data.get("requerimientos"),
+            year=assignment_year,
+            allowed_inactive_ids=current_requirement_ids,
+        )
+        if requirements_error:
+            return jsonify({"message": requirements_error}), 400
+        data["requerimientos"] = project_requirements
 
     if "departamento_id" in data:
         if not is_super_admin(user):

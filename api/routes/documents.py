@@ -13,6 +13,7 @@ from api.util.common import agregar_log
 from api.util.utils import string_to_int, int_to_string
 from api.util.backblaze import upload_file
 from api.services.project_funding_service import ProjectFundingService
+from api.services.requirement_service import RequirementCatalogService
 from api.util.access import (
     can_access_project,
     is_admin_departamento,
@@ -88,6 +89,33 @@ def _normalize_specific_objectives(value):
         text = str(objective or "").strip()
         if text and text not in normalized:
             normalized.append(text)
+    return normalized
+
+
+def _normalize_requirement_references(value):
+    if value in (None, ""):
+        return []
+    parsed = value
+    if isinstance(value, str) and value.strip().startswith("["):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("requerimientos debe ser un arreglo JSON válido") from exc
+    values = parsed if isinstance(parsed, (list, tuple)) else [parsed]
+    normalized = []
+    for requirement in values:
+        if isinstance(requirement, dict):
+            requirement = (
+                requirement.get("requirementId")
+                or requirement.get("requerimientoId")
+                or requirement.get("_id")
+                or requirement.get("id")
+            )
+            if isinstance(requirement, dict):
+                requirement = requirement.get("$oid")
+        requirement_id = str(requirement or "").strip()
+        if requirement_id and requirement_id not in normalized:
+            normalized.append(requirement_id)
     return normalized
 
 
@@ -216,6 +244,13 @@ def _normalize_activity_item(data, existing=None):
         item["accountCode"] = ""
         item["cuenta_contable"] = ""
 
+    requirement_keys = ("requirementId", "requerimientoId", "requirement_id")
+    if any(key in data for key in requirement_keys):
+        requirement_id = next(data.get(key) for key in requirement_keys if key in data)
+        item["requirementId"] = str(requirement_id or "").strip()
+    else:
+        item["requirementId"] = str(existing.get("requirementId") or "").strip()
+
     status = str(existing.get("status") or ITEM_PENDING_STATUS).strip().lower()
     item["status"] = status if status in VALID_ITEM_STATUSES else ITEM_PENDING_STATUS
     return item
@@ -234,6 +269,52 @@ def _validate_activity_item(item, *, is_sponsored=False):
         return "Un item con monto 0 no puede tener una cuenta asociada"
     if amount > 0 and not account_code:
         return "Un item con monto mayor a 0 debe tener una cuenta asociada"
+    return None
+
+
+def _apply_item_requirement(item, documento, proyecto, funding_year):
+    requirement_id = str(item.get("requirementId") or "").strip()
+    if not requirement_id:
+        for field in (
+            "requirementName",
+            "requirementAccountCode",
+            "requirementAccountLevel",
+            "requirementAccountIsHeader",
+        ):
+            item.pop(field, None)
+        return None
+
+    requirement = RequirementCatalogService.find_assignment(documento, requirement_id)
+    if not requirement:
+        return "El requerimiento debe estar asociado a la actividad"
+    if _is_sponsored_activity(documento):
+        return "Los items patrocinados no pueden imputar cuentas de requerimientos"
+
+    account_info = requirement.get("account") or {}
+    linked_code = str(requirement.get("accountCode") or "").strip()
+    if not account_info.get("isHeader"):
+        item["accountCode"] = linked_code
+        item["cuenta_contable"] = linked_code
+    elif not str(item.get("accountCode") or "").strip():
+        return f'Selecciona una cuenta detalle bajo {linked_code} para el requerimiento'
+
+    matches, match_error = RequirementCatalogService.account_matches_requirement(
+        requirement,
+        item.get("accountCode"),
+        funding_year,
+    )
+    if not matches:
+        return match_error
+
+    item["requirementId"] = requirement_id
+    item["requirementName"] = requirement.get("nombre") or ""
+    item["requirementAccountCode"] = linked_code
+    item["requirementAccountLevel"] = int(account_info.get("level") or 0)
+    item["requirementAccountIsHeader"] = bool(account_info.get("isHeader"))
+    if not item.get("nombre"):
+        item["nombre"] = requirement.get("nombre") or ""
+    if not item.get("descripcion"):
+        item["descripcion"] = requirement.get("descripcion") or ""
     return None
 
 
@@ -314,6 +395,7 @@ def _decorate_activity_document(documento):
     documento["specificObjectives"] = specific_objectives
     documento["objetivo_especifico"] = specific_objectives[0] if specific_objectives else ""
     documento["specificObjective"] = documento["objetivo_especifico"]
+    documento["requerimientos"] = documento.get("requerimientos") or []
     if "monto_transferencia" in documento:
         documento["transferAmount"] = documento.get("monto_transferencia")
     if "cuenta_contable" in documento:
@@ -779,8 +861,14 @@ def crear_presupuesto(user):
         "specificObjective",
         "objetivo_especifico",
     )
+    raw_requirements = _pick_form_value(
+        "requirementIds",
+        "requerimientos",
+        "requirements",
+    )
     try:
         objetivos_especificos = _normalize_specific_objectives(raw_objectives)
+        requirement_ids = _normalize_requirement_references(raw_requirements)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     patrocinada = _coerce_bool(_pick_form_value("patrocinada", "isSponsored"), default=False)
@@ -805,7 +893,7 @@ def crear_presupuesto(user):
 
     proyecto = mongo.db.proyectos.find_one(
         {"_id": project_object_id},
-        {"departamento_id": 1, "objetivos_especificos": 1},
+        {"departamento_id": 1, "objetivos_especificos": 1, "requerimientos": 1, "fundingYear": 1},
     )
     if not proyecto:
         return jsonify({"error": "Proyecto no encontrado"}), 404
@@ -818,11 +906,31 @@ def crear_presupuesto(user):
     if objectives_error:
         return jsonify({"error": objectives_error}), 400
 
+    activity_requirements, requirements_error = RequirementCatalogService.resolve_from_project(
+        proyecto,
+        requirement_ids,
+    )
+    if requirements_error:
+        return jsonify({"error": requirements_error}), 400
+
     if patrocinada and not _resolve_sponsored_activity_account_code():
         return jsonify({"error": "No hay una cuenta de patrocinio configurada para crear esta actividad"}), 400
     if patrocinada and requested_amount != 0:
         return jsonify({"error": "Las actividades patrocinadas deben tener monto 0"}), 400
+    funding_year = int(proyecto.get("fundingYear") or datetime.now(timezone.utc).year)
+    requirement_container = {
+        "requerimientos": activity_requirements,
+        "patrocinada": patrocinada,
+    }
     for item in items:
+        item_requirement_error = _apply_item_requirement(
+            item,
+            requirement_container,
+            proyecto,
+            funding_year,
+        )
+        if item_requirement_error:
+            return jsonify({"error": item_requirement_error}), 400
         item_error = _validate_activity_item(item, is_sponsored=patrocinada)
         if item_error:
             return jsonify({"error": item_error}), 400
@@ -839,6 +947,7 @@ def crear_presupuesto(user):
         "status": "new",
         "objetivos_especificos": objetivos_especificos,
         "objetivo_especifico": objetivos_especificos[0] if objetivos_especificos else "",
+        "requerimientos": activity_requirements,
         "patrocinada": patrocinada,
         "items": items,
         "archivos": [],
@@ -909,6 +1018,30 @@ def editar_actividad(user, doc_id):
             return jsonify({"message": objectives_error}), 400
         update_data["objetivos_especificos"] = objetivos_especificos
         update_data["objetivo_especifico"] = objetivos_especificos[0] if objetivos_especificos else ""
+    requirement_keys = ("requirementIds", "requerimientos", "requirements")
+    if any(key in data for key in requirement_keys):
+        raw_requirements = next(data.get(key) for key in requirement_keys if key in data)
+        try:
+            requirement_ids = _normalize_requirement_references(raw_requirements)
+        except ValueError as exc:
+            return jsonify({"message": str(exc)}), 400
+        activity_requirements, requirements_error = RequirementCatalogService.resolve_from_project(
+            proyecto,
+            requirement_ids,
+        )
+        if requirements_error:
+            return jsonify({"message": requirements_error}), 400
+        selected_ids = {item.get("requirementId") for item in activity_requirements}
+        used_ids = {
+            str(item.get("requirementId"))
+            for item in (documento.get("items") or [])
+            if item.get("requirementId") and not item.get("isSynthetic")
+        }
+        if not used_ids.issubset(selected_ids):
+            return jsonify({
+                "message": "No puedes quitar requerimientos que ya están usados por items de la actividad"
+            }), 400
+        update_data["requerimientos"] = activity_requirements
     if "patrocinada" in data or "isSponsored" in data:
         next_sponsored = _coerce_bool(_pick_mapping_value(data, "patrocinada", "isSponsored"))
         if next_sponsored != _is_sponsored_activity(documento) and current_status != "new":
@@ -952,6 +1085,12 @@ def agregar_item_actividad(user, doc_id):
 
     data = request.get_json(silent=True) or {}
     item = _normalize_activity_item(data)
+    funding_year, funding_year_error = _resolve_activity_funding_year(proyecto)
+    if funding_year_error:
+        return funding_year_error
+    requirement_error = _apply_item_requirement(item, documento, proyecto, funding_year)
+    if requirement_error:
+        return jsonify({"message": requirement_error}), 400
     if not item["nombre"]:
         return jsonify({"message": "El nombre del item es requerido"}), 400
     item_error = _validate_activity_item(item, is_sponsored=_is_sponsored_activity(documento))
@@ -990,6 +1129,17 @@ def editar_item_actividad(user, doc_id, item_id):
         if item.get("status") == ITEM_CLOSED_STATUS:
             return jsonify({"message": "No se puede editar un item cerrado administrativamente"}), 400
         items[index] = _normalize_activity_item(data, existing=item)
+        funding_year, funding_year_error = _resolve_activity_funding_year(proyecto)
+        if funding_year_error:
+            return funding_year_error
+        requirement_error = _apply_item_requirement(
+            items[index],
+            documento,
+            proyecto,
+            funding_year,
+        )
+        if requirement_error:
+            return jsonify({"message": requirement_error}), 400
         if not items[index]["nombre"]:
             return jsonify({"message": "El nombre del item es requerido"}), 400
         item_error = _validate_activity_item(items[index], is_sponsored=_is_sponsored_activity(documento))

@@ -28,3 +28,9 @@ def test_requerimientos_son_opcionales_en_proyectos_nuevos():
         "recursos_humanos": "",
         "logistica": "",
     }
+
+
+def test_normaliza_alias_del_catalogo_de_requerimientos():
+    normalized = _normalize_project_payload({"requirementIds": ["req-1", "req-2"]})
+
+    assert normalized == {"requerimientos": ["req-1", "req-2"]}

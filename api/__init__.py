@@ -43,6 +43,7 @@ def create_app(config_class=Config):
     from api.routes.reports import reports_bp
     from api.routes.notifications import notifications_bp
     from api.routes.accounting import accounting_bp
+    from api.routes.requirements import requirements_bp
 
     app.register_blueprint(auth_bp)
     app.register_blueprint(users_bp)
@@ -54,6 +55,7 @@ def create_app(config_class=Config):
     app.register_blueprint(reports_bp)
     app.register_blueprint(notifications_bp)
     app.register_blueprint(accounting_bp)
+    app.register_blueprint(requirements_bp)
 
     @app.route("/", methods=["GET"])
     def index():

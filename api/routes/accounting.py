@@ -140,6 +140,7 @@ def search_accounts(user):
     scope_id = request.args.get("scopeId", "").strip()
     assigned_only = _query_truthy(request.args.get("assignedOnly"), default=False)
     include_zero = _query_truthy(request.args.get("includeZero"), default=True)
+    ancestor_code = request.args.get("ancestorCode", "").strip()
 
     if scope_type == "department" and scope_id and not _can_access_department(user, scope_id):
         return _forbidden("No autorizado para consultar cuentas de este departamento")
@@ -159,6 +160,7 @@ def search_accounts(user):
         scope_id=scope_id or None,
         assigned_only=assigned_only,
         include_zero=include_zero,
+        ancestor_code=ancestor_code or None,
     )
     return jsonify({"year": year, "group": group, "q": q, "results": rows}), 200
 
