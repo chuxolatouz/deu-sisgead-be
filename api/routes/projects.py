@@ -22,6 +22,7 @@ from api.util.access import (
     user_role,
     ROLE_SUPER_ADMIN,
 )
+from api.util.project_members import normalize_project_member_role
 
 projects_bp = Blueprint('projects', __name__)
 PLACEHOLDER = "(POR DEFINIR)"
@@ -545,14 +546,16 @@ def asignar_usuario_proyecto(user):
         schema:
           type: object
           required:
-            - proyecto_id
-            - usuario
+            - projectId
+            - user
             - role
           properties:
-            proyecto_id:
+            projectId:
               type: string
-            usuario:
+              description: También acepta project_id o proyecto_id por compatibilidad
+            user:
               type: object
+              description: También acepta usuario por compatibilidad
             role:
               type: object
               properties:
@@ -569,8 +572,13 @@ def asignar_usuario_proyecto(user):
     data = request.get_json(silent=True) or {}
     proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
     usuario = _pick_value(data, "user", "usuario")
-    if not proyecto_id or not usuario or "role" not in data:
-        return jsonify({"message": "projectId, user y role son requeridos"}), 400
+    role = normalize_project_member_role(data.get("role"))
+    if not proyecto_id:
+        return jsonify({"message": "projectId es requerido (también se acepta project_id o proyecto_id)"}), 400
+    if not usuario:
+        return jsonify({"message": "user es requerido (también se acepta usuario)"}), 400
+    if not role:
+        return jsonify({"message": "role debe incluir value y label válidos"}), 400
 
     project_object_id = parse_object_id(proyecto_id)
     if not project_object_id:
@@ -604,9 +612,14 @@ def asignar_usuario_proyecto(user):
             return jsonify({"message": "El usuario solo puede ser asignado a proyectos de su departamento"}), 400
 
     fecha_hora_actual = datetime.now(timezone.utc)
+    member_user = {
+        key: value
+        for key, value in target_user.items()
+        if key != "password"
+    }
     member_payload = {
-        "usuario": usuario,
-        "role": data["role"],
+        "usuario": member_user,
+        "role": role,
         "fecha_ingreso": fecha_hora_actual.strftime("%d/%m/%Y %H:%M")
     }
 
@@ -620,14 +633,14 @@ def asignar_usuario_proyecto(user):
     if 2 not in proyecto["status"]["completado"]:
         new_status, _ = actualizar_pasos(proyecto["status"], 2)
 
-    if data["role"]["value"] == "lider":
+    if role["value"] == "lider":
         new_status, _ = actualizar_pasos(proyecto["status"], 3)
 
     if bool(new_status):
         query["$set"] = {"status": new_status}
 
     mongo.db.proyectos.update_one({"_id": project_object_id}, query)
-    message_log = f'{usuario["nombre"]} fue asignado al proyecto por {user["nombre"]} con el rol {data["role"]["label"]}'
+    message_log = f'{target_user["nombre"]} fue asignado al proyecto por {user["nombre"]} con el rol {role["label"]}'
     agregar_log(proyecto_id, message_log)
     return jsonify({"message": "Usuario asignado al proyecto con éxito"}), 200
 

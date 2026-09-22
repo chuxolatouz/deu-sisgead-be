@@ -18,6 +18,7 @@ from api.util.access import (
     user_department_id,
     user_role,
 )
+from api.util.project_members import merge_project_member_roles
 
 users_bp = Blueprint('users', __name__)
 
@@ -200,16 +201,18 @@ def roles():
           items:
             type: object
             properties:
-              _id:
+              value:
                 type: string
-              nombre:
+                example: lider
+              label:
                 type: string
+                example: Líder
     """
     roles = mongo.db.roles.find({})
     list_cursor = list(roles)
     list_dump = json_util.dumps(list_cursor, default=json_util.default, ensure_ascii=False)
     list_json = json.loads(list_dump)
-    return jsonify(list_json)
+    return jsonify(merge_project_member_roles(list_json))
 
 @users_bp.route("/crear_rol", methods=["POST"])
 @token_required
