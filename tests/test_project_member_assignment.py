@@ -17,9 +17,11 @@ class RolesCollection:
 
 
 class ProjectCollection:
-    def __init__(self, project):
+    def __init__(self, project, modified_count=1):
         self.project = project
+        self.modified_count = modified_count
         self.last_update = None
+        self.delete_called = False
 
     def find_one(self, query):
         if query.get("_id") == self.project.get("_id"):
@@ -28,7 +30,11 @@ class ProjectCollection:
 
     def update_one(self, query, update):
         self.last_update = (query, update)
-        return SimpleNamespace(modified_count=1)
+        return SimpleNamespace(modified_count=self.modified_count)
+
+    def delete_one(self, _query):
+        self.delete_called = True
+        return SimpleNamespace(deleted_count=1)
 
 
 class UserCollection:
@@ -128,3 +134,87 @@ def test_assign_member_rejects_incomplete_role_without_internal_error():
 
     assert status == 400
     assert response.get_json()["message"] == "role debe incluir value y label válidos"
+
+
+@pytest.mark.parametrize("stored_user_id_factory", [lambda value: value, lambda value: {"$oid": str(value)}])
+def test_remove_member_uses_the_stored_user_id_shape(monkeypatch, stored_user_id_factory):
+    project_id = ObjectId()
+    user_id = ObjectId()
+    stored_user_id = stored_user_id_factory(user_id)
+    project = {
+        "_id": project_id,
+        "miembros": [
+            {
+                "usuario": {"_id": stored_user_id, "nombre": "Miembro"},
+                "role": {"value": "miembro", "label": "Miembro"},
+            }
+        ],
+    }
+    projects = ProjectCollection(project)
+    monkeypatch.setattr(
+        projects_routes,
+        "mongo",
+        SimpleNamespace(db=SimpleNamespace(proyectos=projects)),
+    )
+    monkeypatch.setattr(projects_routes, "agregar_log", lambda *_args, **_kwargs: None)
+    actor = {"sub": str(ObjectId()), "nombre": "Administrador", "role": "super_admin"}
+
+    with app.test_request_context(json={"projectId": str(project_id), "userId": str(user_id)}):
+        response, status = projects_routes.eliminar_usuario_proyecto.__wrapped__.__wrapped__(actor)
+
+    assert status == 200
+    assert response.get_json()["message"] == "Usuario eliminado del proyecto con éxito"
+    assert projects.last_update[1]["$pull"]["miembros"]["usuario._id"] == stored_user_id
+
+
+def test_remove_member_reports_when_database_did_not_modify_project(monkeypatch):
+    project_id = ObjectId()
+    user_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "miembros": [{"usuario": {"_id": user_id, "nombre": "Miembro"}}],
+    }
+    projects = ProjectCollection(project, modified_count=0)
+    monkeypatch.setattr(
+        projects_routes,
+        "mongo",
+        SimpleNamespace(db=SimpleNamespace(proyectos=projects)),
+    )
+    monkeypatch.setattr(projects_routes, "agregar_log", lambda *_args, **_kwargs: None)
+    actor = {"sub": str(ObjectId()), "nombre": "Administrador", "role": "super_admin"}
+
+    with app.test_request_context(json={"projectId": str(project_id), "userId": str(user_id)}):
+        response, status = projects_routes.eliminar_usuario_proyecto.__wrapped__.__wrapped__(actor)
+
+    assert status == 409
+    assert response.get_json()["message"] == "No se pudo eliminar el usuario del proyecto"
+
+
+def test_department_user_cannot_delete_project_they_do_not_own(monkeypatch):
+    project_id = ObjectId()
+    department_id = ObjectId()
+    projects = ProjectCollection(
+        {
+            "_id": project_id,
+            "owner": ObjectId(),
+            "departamento_id": department_id,
+        }
+    )
+    monkeypatch.setattr(
+        projects_routes,
+        "mongo",
+        SimpleNamespace(db=SimpleNamespace(proyectos=projects)),
+    )
+    actor = {
+        "sub": str(ObjectId()),
+        "nombre": "Usuario",
+        "role": "usuario",
+        "departmentId": str(department_id),
+    }
+
+    with app.test_request_context(json={"projectId": str(project_id)}):
+        response, status = projects_routes.eliminar_proyecto.__wrapped__.__wrapped__(actor)
+
+    assert status == 403
+    assert "propietario" in response.get_json()["message"]
+    assert projects.delete_called is False

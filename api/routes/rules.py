@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify
-from bson import ObjectId, json_util
+from bson import json_util
 import json
 from datetime import datetime, timezone
 
@@ -8,7 +8,7 @@ from api.util.decorators import token_required, allow_cors
 from api.util.common import agregar_log
 from api.util.utils import int_to_string, actualizar_pasos
 from api.services.project_funding_service import ProjectFundingService
-from api.util.access import can_access_project, parse_object_id
+from api.util.access import can_access_project, is_super_admin, parse_object_id
 
 rules_bp = Blueprint('rules', __name__)
 
@@ -83,14 +83,32 @@ def crear_solicitud_regla_fija(user):
       200:
         description: Solicitud creada
     """
-    data = request.get_json()
-    solicitud_regla = {}
-    items = data["items"]
-    for item in items:
-        item["monto"] = item["monto"] * 100
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    items = data.get("items")
+    if not name:
+        return jsonify({"message": "name es requerido"}), 400
+    if not isinstance(items, list) or not items:
+        return jsonify({"message": "items debe ser una lista con al menos un elemento"}), 400
 
-    solicitud_regla["nombre"] = data["name"]
-    solicitud_regla["reglas"] = items
+    normalized_items = []
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            return jsonify({"message": f"El item {index + 1} es inválido"}), 400
+        item_name = str(item.get("nombre_regla") or "").strip()
+        if not item_name:
+            return jsonify({"message": f"El nombre del item {index + 1} es requerido"}), 400
+        try:
+            amount = float(item.get("monto"))
+        except (TypeError, ValueError):
+            return jsonify({"message": f"El monto del item {index + 1} es inválido"}), 400
+        if amount < 0:
+            return jsonify({"message": f"El monto del item {index + 1} no puede ser negativo"}), 400
+        normalized_items.append({**item, "nombre_regla": item_name, "monto": round(amount * 100)})
+
+    solicitud_regla = {}
+    solicitud_regla["nombre"] = name
+    solicitud_regla["reglas"] = normalized_items
     solicitud_regla["status"] = "new"
     solicitud_regla["usuario"] = user
     mongo.db.solicitudes.insert_one(solicitud_regla)
@@ -98,7 +116,8 @@ def crear_solicitud_regla_fija(user):
 
 @rules_bp.route("/eliminar_solicitud_regla_fija/<string:id>", methods=["POST"])
 @allow_cors
-def eliminar_solicitud_regla_fija(id):
+@token_required
+def eliminar_solicitud_regla_fija(user, id):
     """
     Eliminar solicitud de regla fija
     ---
@@ -115,7 +134,14 @@ def eliminar_solicitud_regla_fija(id):
       400:
         description: No se pudo eliminar
     """
-    query = {"_id": ObjectId(id)}
+    if not is_super_admin(user):
+        return _forbidden("Solo super_admin puede eliminar solicitudes de reglas fijas")
+
+    request_object_id = parse_object_id(id)
+    if not request_object_id:
+        return jsonify({"message": "ID de solicitud inválido"}), 400
+
+    query = {"_id": request_object_id}
     result = mongo.db.solicitudes.delete_one(query)
     if result.deleted_count == 1:
         return jsonify({"message": "Solicitud de regla eliminada con éxito"}), 200
@@ -124,7 +150,8 @@ def eliminar_solicitud_regla_fija(id):
 
 @rules_bp.route("/completar_solicitud_regla_fija/<string:id>", methods=["POST"])
 @allow_cors
-def completar_solicitud_regla_fija(id):
+@token_required
+def completar_solicitud_regla_fija(user, id):
     """
     Completar o rechazar solicitud de regla
     ---
@@ -152,14 +179,24 @@ def completar_solicitud_regla_fija(id):
       400:
         description: No se pudo actualizar
     """
-    data = request.get_json()
-    resolution = data["resolution"]
-    query = {"_id": ObjectId(id)}
+    if not is_super_admin(user):
+        return _forbidden("Solo super_admin puede resolver solicitudes de reglas fijas")
+
+    request_object_id = parse_object_id(id)
+    if not request_object_id:
+        return jsonify({"message": "ID de solicitud inválido"}), 400
+
+    data = request.get_json(silent=True) or {}
+    resolution = str(data.get("resolution") or "").strip().lower()
+    if resolution not in {"completed", "rejected"}:
+        return jsonify({"message": "resolution debe ser completed o rejected"}), 400
+
+    query = {"_id": request_object_id}
     result = mongo.db.solicitudes.update_one(query, {"$set": {"status": resolution}})
     if result.modified_count == 1:
-        return jsonify({"message": "Solicitud de regla eliminada con éxito"}), 200
+        return jsonify({"message": "Solicitud de regla actualizada con éxito"}), 200
     else:
-        return jsonify({"message": "No se pudo eliminar la regla"}), 400
+        return jsonify({"message": "No se pudo actualizar la solicitud"}), 400
 
 @rules_bp.route("/mostrar_reglas_fijas", methods=["GET"])
 @allow_cors

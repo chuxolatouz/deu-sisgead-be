@@ -701,10 +701,17 @@ def eliminar_usuario_proyecto(user):
     if usuario is None:
         return jsonify({"message": "El usuario no es miembro del proyecto"}), 400
 
-    mongo.db.proyectos.update_one(
+    stored_user_id = usuario.get("_id") if isinstance(usuario, dict) else None
+    if stored_user_id in (None, ""):
+        return jsonify({"message": "El miembro no tiene un ID de usuario válido"}), 400
+
+    result = mongo.db.proyectos.update_one(
         {"_id": project_object_id},
-        {"$pull": {"miembros": {"usuario._id.$oid": usuario_id}}},
+        {"$pull": {"miembros": {"usuario._id": stored_user_id}}},
     )
+    if result.modified_count != 1:
+        return jsonify({"message": "No se pudo eliminar el usuario del proyecto"}), 409
+
     message_log = f'{usuario["nombre"]} fue eliminado del proyecto por {user["nombre"]}'
     agregar_log(proyecto_id, message_log)
     return jsonify({"message": "Usuario eliminado del proyecto con éxito"}), 200
@@ -1135,9 +1142,8 @@ def eliminar_proyecto(user):
     if documento is None:
         return jsonify({"message": "Proyecto no encontrado"}), 404
 
-    access_error = _ensure_project_access(user, documento)
-    if access_error:
-        return access_error
+    if not can_edit_project(user, documento):
+        return _forbidden("Solo el propietario o un super administrador puede eliminar el proyecto")
 
     result = mongo.db.proyectos.delete_one({"_id": project_object_id})
     if result.deleted_count == 1:
