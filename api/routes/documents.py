@@ -256,7 +256,7 @@ def _normalize_activity_item(data, existing=None):
     return item
 
 
-def _validate_activity_item(item, *, is_sponsored=False):
+def _validate_activity_item(item, *, is_sponsored=False, require_account=False):
     amount = int(item.get("monto") or 0)
     account_code = str(item.get("accountCode") or item.get("cuenta_contable") or "").strip()
     if amount < 0:
@@ -267,7 +267,7 @@ def _validate_activity_item(item, *, is_sponsored=False):
         return None
     if amount == 0 and account_code:
         return "Un item con monto 0 no puede tener una cuenta asociada"
-    if amount > 0 and not account_code:
+    if require_account and amount > 0 and not account_code:
         return "Un item con monto mayor a 0 debe tener una cuenta asociada"
     return None
 
@@ -296,13 +296,23 @@ def _apply_item_requirement(item, documento, proyecto, funding_year):
         item["accountCode"] = linked_code
         item["cuenta_contable"] = linked_code
     elif not str(item.get("accountCode") or "").strip():
-        return f'Selecciona una cuenta detalle bajo {linked_code} para el requerimiento'
+        item["accountCode"] = ""
+        item["cuenta_contable"] = ""
+        matches = True
+        match_error = None
+    else:
+        matches, match_error = RequirementCatalogService.account_matches_requirement(
+            requirement,
+            item.get("accountCode"),
+            funding_year,
+        )
 
-    matches, match_error = RequirementCatalogService.account_matches_requirement(
-        requirement,
-        item.get("accountCode"),
-        funding_year,
-    )
+    if not account_info.get("isHeader"):
+        matches, match_error = RequirementCatalogService.account_matches_requirement(
+            requirement,
+            item.get("accountCode"),
+            funding_year,
+        )
     if not matches:
         return match_error
 
@@ -316,6 +326,59 @@ def _apply_item_requirement(item, documento, proyecto, funding_year):
     if not item.get("descripcion"):
         item["descripcion"] = requirement.get("descripcion") or ""
     return None
+
+
+def _parse_item_account_mappings(payload):
+    raw = _pick_mapping_value(payload, "accountMappings", "cuentasItems")
+    if raw in (None, ""):
+        return {}
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        raise ValueError("accountMappings debe ser un objeto JSON válido")
+    if isinstance(parsed, list):
+        return {
+            str(item.get("itemId") or item.get("id") or ""): str(item.get("accountCode") or "").strip()
+            for item in parsed
+            if isinstance(item, dict) and (item.get("itemId") or item.get("id"))
+        }
+    if isinstance(parsed, dict):
+        return {str(key): str(value or "").strip() for key, value in parsed.items()}
+    raise ValueError("accountMappings debe ser un objeto o arreglo")
+
+
+def _resolve_item_liquidation_account(item, documento, funding_year, candidate_account):
+    amount = int(item.get("monto") or 0)
+    if amount <= 0:
+        return "", None
+
+    requirement_id = str(item.get("requirementId") or "").strip()
+    requirement = RequirementCatalogService.find_assignment(documento, requirement_id) if requirement_id else None
+    selected_code = str(candidate_account or "").strip()
+
+    if requirement:
+        linked_code = str(requirement.get("accountCode") or "").strip()
+        if not (requirement.get("account") or {}).get("isHeader"):
+            selected_code = linked_code
+        if not selected_code:
+            return None, f'El item {item.get("nombre") or item.get("id")} requiere una cuenta detalle para su cierre'
+        matches, match_error = RequirementCatalogService.account_matches_requirement(
+            requirement,
+            selected_code,
+            funding_year,
+        )
+        if not matches:
+            return None, match_error
+        return selected_code, None
+
+    if not selected_code:
+        return None, f'El item {item.get("nombre") or item.get("id")} requiere una cuenta contable en el cierre'
+    account = RequirementCatalogService.find_account(funding_year, selected_code)
+    if not account:
+        return None, "La cuenta contable seleccionada no existe para el año del proyecto"
+    if account.get("is_header"):
+        return None, "Selecciona una cuenta detalle para liquidar el gasto"
+    return selected_code, None
 
 
 def _parse_activity_items_from_form():
@@ -651,6 +714,10 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
     transfer_amount = _pick_mapping_value(payload, "transferAmount", "monto_transferencia") or ""
     fallback_account = str(_pick_mapping_value(payload, "accountCode", "cuenta_contable") or "").strip()
     fallback_amount = _pick_mapping_value(payload, "monto", "amount", "montoAprobado")
+    try:
+        account_mappings = _parse_item_account_mappings(payload)
+    except ValueError as exc:
+        return None, (jsonify({"error": str(exc)}), 400)
     actor_name = user.get("nombre", "Usuario")
     now = datetime.utcnow()
 
@@ -665,21 +732,48 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
     if not target_item_ids:
         return None, (jsonify({"error": "No hay items pendientes por cerrar"}), 400)
 
+    resolved_accounts = {}
+    approved_amounts = {}
     for item in items:
         if str(item.get("id")) not in target_item_ids:
             continue
         approved_cents = 0 if is_sponsored else int(item.get("monto") or 0)
         if fallback_amount not in (None, "") and item_id is not None:
             approved_cents = 0 if is_sponsored else _amount_to_cents(fallback_amount, default=approved_cents)
-        account_code = sponsored_account if is_sponsored else str(
-            item.get("accountCode") or item.get("cuenta_contable") or fallback_account
-        ).strip()
+        item_key = str(item.get("id"))
+        candidate_account = account_mappings.get(item_key) or item.get("accountCode") or item.get("cuenta_contable") or fallback_account
+        if is_sponsored:
+            account_code = sponsored_account
+            account_error = None
+        else:
+            account_code, account_error = _resolve_item_liquidation_account(
+                item,
+                documento,
+                funding_year,
+                candidate_account,
+            )
+        if account_error:
+            return None, (jsonify({"error": account_error}), 400)
         if approved_cents < 0:
             return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} no puede tener un monto negativo"}), 400)
         if not is_sponsored and approved_cents == 0 and account_code:
             return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} con monto 0 no puede tener una cuenta asociada"}), 400)
         if not is_sponsored and approved_cents > 0 and not account_code:
             return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} requiere una partida asociada"}), 400)
+        resolved_accounts[item_key] = account_code
+        approved_amounts[item_key] = approved_cents
+
+    if not is_sponsored:
+        total_to_liquidate = sum(approved_amounts.values())
+        available_cents = _amount_to_cents(
+            ProjectFundingService.build_summary(
+                proyecto,
+                year=funding_year,
+                user=user,
+            ).get("totals", {}).get("currentAvailable", 0)
+        )
+        if total_to_liquidate > available_cents:
+            return None, (jsonify({"error": "El monto aprobado excede el saldo disponible del proyecto"}), 400)
 
     closure_id = str(ObjectId())
     uploaded_attachments = []
@@ -703,12 +797,9 @@ def _close_activity_items(documento, proyecto, user, funding_year, payload=None,
             updated_items.append(item)
             continue
 
-        account_code = sponsored_account if is_sponsored else str(
-            item.get("accountCode") or item.get("cuenta_contable") or fallback_account
-        ).strip()
-        approved_cents = 0 if is_sponsored else int(item.get("monto") or 0)
-        if fallback_amount not in (None, "") and item_id is not None:
-            approved_cents = 0 if is_sponsored else _amount_to_cents(fallback_amount, default=approved_cents)
+        item_key = str(item.get("id"))
+        account_code = resolved_accounts.get(item_key, sponsored_account if is_sponsored else "")
+        approved_cents = approved_amounts.get(item_key, 0)
         if approved_cents < 0:
             return None, (jsonify({"error": f"El item {item.get('nombre') or item.get('id')} no puede tener un monto negativo"}), 400)
         if not is_sponsored and approved_cents == 0 and account_code:
@@ -1279,6 +1370,7 @@ def cerrar_presupuesto(user):
     monto_transferencia = _pick_form_value("transferAmount", "monto_transferencia")
     banco = (request.form.get("banco") or "").strip()
     cuenta_contable = (_pick_form_value("accountCode", "cuenta_contable") or "").strip()
+    closure_requirement_id = (_pick_form_value("requirementId", "requerimientoId") or "").strip()
 
     if not id or not doc_id:
         return jsonify({"error": "projectId y docId son requeridos"}), 400
@@ -1333,6 +1425,7 @@ def cerrar_presupuesto(user):
             "transferAmount": monto_transferencia,
             "banco": banco,
             "accountCode": cuenta_contable,
+            "accountMappings": request.form.get("accountMappings"),
         }
         updated_documento, close_error = _close_activity_items(
             documento,
@@ -1371,6 +1464,19 @@ def cerrar_presupuesto(user):
         return jsonify({"error": "monto inválido"}), 400
     if data_balance_int < 0:
         return jsonify({"error": "El monto aprobado no puede ser negativo"}), 400
+    if not is_sponsored and data_balance_int > 0 and closure_requirement_id:
+        requirement = RequirementCatalogService.find_assignment(documento, closure_requirement_id)
+        if not requirement:
+            return jsonify({"error": "El requerimiento seleccionado no pertenece a la actividad"}), 400
+        if not (requirement.get("account") or {}).get("isHeader"):
+            cuenta_contable = str(requirement.get("accountCode") or "").strip()
+        matches, match_error = RequirementCatalogService.account_matches_requirement(
+            requirement,
+            cuenta_contable,
+            funding_year,
+        )
+        if not matches:
+            return jsonify({"error": match_error}), 400
     if not is_sponsored and data_balance_int == 0 and cuenta_contable:
         return jsonify({"error": "Un cierre con monto 0 no puede tener una cuenta asociada"}), 400
     if not is_sponsored and data_balance_int > 0 and not cuenta_contable:
@@ -1411,6 +1517,7 @@ def cerrar_presupuesto(user):
                     "actorName": actor_name,
                     "title": "Consumo por actividad",
                     "accountCode": cuenta_contable,
+                    "requirementId": closure_requirement_id,
                     "referenceNumber": referencia,
                     "bank": banco,
                     "transferAmount": monto_transferencia,
@@ -1450,6 +1557,7 @@ def cerrar_presupuesto(user):
                 "banco": banco,
                 "cuenta_contable": cuenta_contable,
                 "accountCode": cuenta_contable,
+                "requirementId": closure_requirement_id,
                 "patrocinada": is_sponsored,
                 "administrative_closed_at": datetime.utcnow(),
                 "administrativeAttachments": [

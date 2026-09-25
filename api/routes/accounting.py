@@ -99,6 +99,18 @@ def _allow_negative_balances() -> bool:
     return os.getenv("ACCOUNTING_ALLOW_NEGATIVE", "true").strip().lower() in {"1", "true", "yes", "si"}
 
 
+def _project_uses_unified_pool(project_id: str) -> bool:
+    try:
+        project_object_id = ObjectId(str(project_id))
+    except Exception:
+        return False
+    project = mongo.db.proyectos.find_one({"_id": project_object_id})
+    if not project:
+        return False
+    model = ProjectFundingService.ensure_model(project, persist=True)
+    return int(model.get("version") or 0) >= 3 and model.get("status") == "pooled"
+
+
 def _query_truthy(value: Optional[str], default: bool = False) -> bool:
     if value is None:
         return default
@@ -274,6 +286,10 @@ def init_project_accounts(user, project_id):
     if not allowed:
         return _forbidden("No autorizado para inicializar cuentas de este proyecto")
 
+    model = ProjectFundingService.ensure_model(project, persist=True)
+    if int(model.get("version") or 0) >= 3 and model.get("status") == "pooled":
+        return jsonify({"message": "La bolsa única no requiere inicializar cuentas por proyecto"}), 409
+
     year = _parse_year()
     mode = request.args.get("mode", "detail_only")
     try:
@@ -291,6 +307,12 @@ def post_project_movement(user, project_id):
     allowed, project = _can_access_project(user, project_id)
     if not allowed:
         return _forbidden("No autorizado para registrar movimientos en este proyecto")
+
+    model = ProjectFundingService.ensure_model(project, persist=True)
+    if int(model.get("version") or 0) >= 3 and model.get("status") == "pooled":
+        return jsonify({
+            "message": "Los proyectos con bolsa única solo admiten fondeos y liquidaciones mediante sus flujos administrativos"
+        }), 409
 
     data = request.get_json(silent=True) or {}
     account_code = data.get("accountCode")
@@ -677,6 +699,13 @@ def admin_transfer_between_accounts(user):
         return jsonify({"message": "fromAccountCode y toAccountCode son requeridos"}), 400
     if amount is None:
         return jsonify({"message": "amount es requerido"}), 400
+    if (
+        (from_scope_type == "project" and _project_uses_unified_pool(from_scope_id))
+        or (to_scope_type == "project" and _project_uses_unified_pool(to_scope_id))
+    ):
+        return jsonify({
+            "message": "Los proyectos con bolsa única deben fondearse y liquidarse mediante sus flujos administrativos"
+        }), 409
 
     try:
         amount_value = float(amount)
@@ -738,6 +767,10 @@ def admin_create_movement(user):
             return jsonify({"message": "scopeId es requerido"}), 400
     if not account_code or amount is None or movement_type not in {"debit", "credit"}:
         return jsonify({"message": "Campos requeridos: accountCode, type, amount"}), 400
+    if scope_type == "project" and _project_uses_unified_pool(scope_id):
+        return jsonify({
+            "message": "Los proyectos con bolsa única no admiten movimientos directos por cuenta"
+        }), 409
 
     try:
         amount_value = float(amount)

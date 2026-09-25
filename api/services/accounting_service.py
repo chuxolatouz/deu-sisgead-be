@@ -104,6 +104,13 @@ class AccountingIndexes:
         db.ledger_movements.create_index([("year", 1), ("accountCode", 1)])
         db.ledger_movements.create_index([("year", 1), ("reference.kind", 1), ("reference.id", 1)])
 
+        db.project_fund_state.create_index([("year", 1), ("projectId", 1)], unique=True)
+        db.project_fund_movements.create_index(
+            [("year", 1), ("projectId", 1), ("createdAt", -1)]
+        )
+        db.project_fund_movements.create_index([("operationId", 1)], unique=True, sparse=True)
+        db.project_fund_movements.create_index([("expenseAccountCode", 1), ("year", 1)])
+
         db.departamentos.create_index([("accountingUnitCode", 1)], sparse=True)
         cls._created = True
 

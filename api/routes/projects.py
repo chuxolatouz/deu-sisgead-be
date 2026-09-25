@@ -825,10 +825,10 @@ def asignar_balance(user):
         return jsonify({"message": "balance es requerido"}), 400
 
     model = ProjectFundingService.ensure_model(proyecto, persist=True)
-    if model.get("status") in {"active", "pending_migration"}:
-        return jsonify({"message": "Este proyecto usa fondeo por partidas. Utiliza el flujo de asignacion de fondos."}), 409
+    if model.get("status") in {"active", "pending_migration", "pooled"}:
+        return jsonify({"message": "Este proyecto usa la gestión contable. Utiliza el flujo de asignación de fondos."}), 409
     if not _allow_legacy_project_balance():
-        return jsonify({"message": "La carga manual de saldo legacy esta deshabilitada. Migra el proyecto a partidas."}), 409
+        return jsonify({"message": "La carga manual de saldo legacy está deshabilitada. Consolida el proyecto en una bolsa única."}), 409
 
     data_balance = string_to_int(data.get("balance"))
     balance = data_balance + int(proyecto["balance"])

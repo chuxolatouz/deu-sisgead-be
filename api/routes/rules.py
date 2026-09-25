@@ -317,14 +317,15 @@ def asignar_regla_fija(user):
         grouped_amounts[account_code] = round(grouped_amounts.get(account_code, 0) + amount_units, 2)
         normalized_items.append({"item": item, "accountCode": account_code, "amountUnits": amount_units})
 
-    for account_code, total_amount in grouped_amounts.items():
-        balance = ProjectFundingService._project_balance_for_account(
-            proyecto_id,
-            account_code,
-            year=funding_year,
-        )
-        if (balance - total_amount) < 0:
-            return jsonify({"message": f"Saldo insuficiente en la partida {account_code} para aplicar la regla fija"}), 400
+    total_rule_amount = round(sum(grouped_amounts.values()), 2)
+    funding_summary = ProjectFundingService.build_summary(
+        proyecto,
+        year=funding_year,
+        user=user,
+    )
+    available = float(funding_summary.get("totals", {}).get("currentAvailable", 0) or 0)
+    if (available - total_rule_amount) < 0:
+        return jsonify({"message": "Saldo insuficiente en la bolsa del proyecto para aplicar la regla fija"}), 400
 
     for item_data in normalized_items:
         item = item_data["item"]

@@ -3,8 +3,10 @@ from __future__ import annotations
 from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+import uuid
 
 from bson import ObjectId
+from pymongo import ReturnDocument
 
 from api.extensions import mongo
 from api.services.accounting_service import (
@@ -16,7 +18,7 @@ from api.util.common import agregar_log
 from api.util.utils import actualizar_pasos
 
 
-PROJECT_FUNDING_VERSION = 2
+PROJECT_FUNDING_VERSION = 3
 
 
 def _now_utc() -> datetime:
@@ -53,7 +55,7 @@ def _clean_str(value: Any) -> str:
 def _build_default_model() -> Dict[str, Any]:
     return {
         "version": PROJECT_FUNDING_VERSION,
-        "status": "active",
+        "status": "pooled",
         "configuredAt": None,
         "migratedAt": None,
         "migratedBy": None,
@@ -82,11 +84,16 @@ class ProjectFundingService:
                 }
             else:
                 model = _build_default_model()
+                if project_id:
+                    model["version"] = 2
+                    model["status"] = "active"
             changed = True
 
         for key, value in _build_default_model().items():
             if key not in model:
-                model[key] = value
+                # Existing models without a version are segmented models, not
+                # new pooled projects. Keep that distinction for migration.
+                model[key] = 2 if key == "version" and project_id else value
                 changed = True
 
         if model.get("status") == "legacy":
@@ -105,6 +112,72 @@ class ProjectFundingService:
             mongo.db.proyectos.update_one({"_id": project_id}, {"$set": {"fundingModel": model}})
 
         return model
+
+    @staticmethod
+    def _pool_state_filter(project_id: Any, year: int) -> Dict[str, Any]:
+        return {"year": int(year), "projectId": str(project_id)}
+
+    @staticmethod
+    def _empty_pool_state(project_id: Any, year: int) -> Dict[str, Any]:
+        now = _now_utc()
+        return {
+            "year": int(year),
+            "projectId": str(project_id),
+            "currency": "VES",
+            "initialFundedCents": 0,
+            "totalFundedCents": 0,
+            "liquidatedCents": 0,
+            "availableCents": 0,
+            "movementsCount": 0,
+            "createdAt": now,
+            "updatedAt": now,
+            "lastMovementAt": None,
+        }
+
+    @staticmethod
+    def get_pool_state(project_id: Any, year: int = DEFAULT_YEAR, *, create: bool = False) -> Dict[str, Any]:
+        AccountingIndexes.ensure_indexes()
+        state_filter = ProjectFundingService._pool_state_filter(project_id, year)
+        state = mongo.db.project_fund_state.find_one(state_filter, {"_id": 0})
+        if state or not create:
+            return state or ProjectFundingService._empty_pool_state(project_id, year)
+
+        empty_state = ProjectFundingService._empty_pool_state(project_id, year)
+        mongo.db.project_fund_state.update_one(
+            state_filter,
+            {"$setOnInsert": empty_state},
+            upsert=True,
+        )
+        return mongo.db.project_fund_state.find_one(state_filter, {"_id": 0}) or empty_state
+
+    @staticmethod
+    def _pool_totals(project: Dict[str, Any], year: int) -> Dict[str, Any]:
+        state = ProjectFundingService.get_pool_state(project.get("_id"), year, create=False)
+        last_movement = state.get("lastMovementAt")
+        sources = list(
+            mongo.db.project_fund_movements.find(
+                {
+                    "year": int(year),
+                    "projectId": str(project.get("_id")),
+                    "type": "funding",
+                },
+                {"sourceAccountCode": 1},
+            )
+        )
+        source_codes = {
+            str(item.get("sourceAccountCode") or "").strip()
+            for item in sources
+            if item.get("sourceAccountCode")
+        }
+        return {
+            "currentAvailable": _cents_to_units(state.get("availableCents")),
+            "initialAssigned": _cents_to_units(state.get("totalFundedCents")),
+            "totalFunded": _cents_to_units(state.get("totalFundedCents")),
+            "totalLiquidated": _cents_to_units(state.get("liquidatedCents")),
+            "fundingSourcesCount": len(source_codes),
+            "fundedAccountsCount": 0,
+            "lastMovementAt": last_movement,
+        }
 
     @staticmethod
     def get_project_detail_states(project_id: str, year: int = DEFAULT_YEAR) -> List[Dict[str, Any]]:
@@ -190,6 +263,9 @@ class ProjectFundingService:
         ProjectFundingService.ensure_model(project, persist=True)
         project_id = str(project.get("_id"))
         model = project["fundingModel"]
+        if int(model.get("version") or 0) >= PROJECT_FUNDING_VERSION and model.get("status") == "pooled":
+            return ProjectFundingService._pool_totals(project, year)
+
         rows = ProjectFundingService.get_project_detail_states(project_id, year=year)
 
         if model.get("status") in {"legacy", "pending_migration"} and not rows:
@@ -216,6 +292,9 @@ class ProjectFundingService:
         return {
             "currentAvailable": current_available,
             "initialAssigned": initial_assigned,
+            "totalFunded": initial_assigned,
+            "totalLiquidated": max(round(initial_assigned - current_available, 2), 0),
+            "fundingSourcesCount": 0,
             "fundedAccountsCount": funded_accounts_count,
             "lastMovementAt": last_movement_at,
         }
@@ -256,8 +335,11 @@ class ProjectFundingService:
             "projectId": str(project.get("_id")),
             "model": {
                 "version": model.get("version", PROJECT_FUNDING_VERSION),
-                "status": model.get("status", "active"),
-                "migrationRequired": model.get("status") in {"legacy", "pending_migration"},
+                "status": model.get("status", "pooled"),
+                "migrationRequired": (
+                    int(model.get("version") or 0) < PROJECT_FUNDING_VERSION
+                    or model.get("status") in {"legacy", "pending_migration", "active"}
+                ),
             },
             "permissions": permissions,
             "totals": totals,
@@ -333,6 +415,198 @@ class ProjectFundingService:
         return float((state or {}).get("balance", 0) or 0)
 
     @staticmethod
+    def _record_pool_movement(
+        project: Dict[str, Any],
+        *,
+        year: int,
+        movement_type: str,
+        amount_cents: int,
+        user: Dict[str, Any],
+        description: str,
+        reference: Optional[Dict[str, Any]] = None,
+        source_scope_type: Optional[str] = None,
+        source_scope_id: Optional[str] = None,
+        source_account_code: Optional[str] = None,
+        expense_account_code: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if movement_type not in {"funding", "liquidation", "rule", "adjustment", "reversal"}:
+            raise ValueError("Tipo de movimiento de fondos inválido")
+        if int(amount_cents) <= 0:
+            raise ValueError("El monto debe ser mayor que 0")
+
+        ProjectFundingService.ensure_model(project, persist=True)
+        state_filter = ProjectFundingService._pool_state_filter(project.get("_id"), year)
+        now = _now_utc()
+        operation_id = str(uuid.uuid4())
+        is_inflow = movement_type in {"funding", "reversal"}
+        delta_cents = int(amount_cents) if is_inflow else -int(amount_cents)
+        query = dict(state_filter)
+        if not is_inflow:
+            query["availableCents"] = {"$gte": int(amount_cents)}
+
+        increments = {
+            "availableCents": delta_cents,
+            "movementsCount": 1,
+        }
+        if movement_type == "funding":
+            increments["initialFundedCents"] = int(amount_cents)
+            increments["totalFundedCents"] = int(amount_cents)
+        elif movement_type in {"liquidation", "rule"}:
+            increments["liquidatedCents"] = int(amount_cents)
+        elif movement_type == "reversal":
+            increments["liquidatedCents"] = -int(amount_cents)
+
+        counter_fields = {
+            "initialFundedCents",
+            "totalFundedCents",
+            "liquidatedCents",
+            "availableCents",
+            "movementsCount",
+        }
+        insert_defaults = {
+            "year": int(year),
+            "projectId": str(project.get("_id")),
+            "currency": "VES",
+            "createdAt": now,
+            **{field: 0 for field in counter_fields if field not in increments},
+        }
+        state = mongo.db.project_fund_state.find_one_and_update(
+            query,
+            {
+                # Do not repeat incremented fields in $setOnInsert: MongoDB
+                # rejects updates that modify the same path twice.
+                "$setOnInsert": insert_defaults,
+                "$inc": increments,
+                "$set": {"lastMovementAt": now, "updatedAt": now},
+            },
+            upsert=movement_type == "funding",
+            return_document=ReturnDocument.AFTER,
+        )
+        if not state:
+            raise ValueError("El monto aprobado excede el saldo disponible del proyecto")
+
+        movement = {
+            "operationId": operation_id,
+            "year": int(year),
+            "projectId": str(project.get("_id")),
+            "type": movement_type,
+            "amountCents": int(amount_cents),
+            "deltaCents": delta_cents,
+            "balanceAfterCents": int(state.get("availableCents", 0) or 0),
+            "currency": "VES",
+            "description": description or "",
+            "reference": reference or {},
+            "sourceScopeType": source_scope_type,
+            "sourceScopeId": str(source_scope_id) if source_scope_id else None,
+            "sourceAccountCode": source_account_code,
+            "expenseAccountCode": expense_account_code,
+            "createdBy": str(user.get("sub") or ""),
+            "actorName": user.get("nombre", "Usuario"),
+            "createdAt": now,
+        }
+        try:
+            mongo.db.project_fund_movements.insert_one(movement)
+        except Exception:
+            rollback = {key: -value for key, value in increments.items()}
+            mongo.db.project_fund_state.update_one(
+                state_filter,
+                {"$inc": rollback, "$set": {"updatedAt": _now_utc()}},
+            )
+            raise
+
+        movement.pop("_id", None)
+        return {"movement": movement, "state": state}
+
+    @staticmethod
+    def migrate_to_pool(
+        project: Dict[str, Any],
+        *,
+        year: int,
+        user: Dict[str, Any],
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        project = mongo.db.proyectos.find_one({"_id": project["_id"]}) or project
+        model = ProjectFundingService.ensure_model(project, persist=True)
+        if int(model.get("version") or 0) >= PROJECT_FUNDING_VERSION and model.get("status") == "pooled":
+            return {
+                "projectId": str(project["_id"]),
+                "operation": "migration",
+                "alreadyMigrated": True,
+                "fundingSummary": ProjectFundingService.build_summary(project, year=year, user=user),
+            }
+
+        legacy_totals = ProjectFundingService._derived_totals(project, year=year)
+        available_cents = _amount_to_cents(legacy_totals.get("currentAvailable"))
+        funded_cents = _amount_to_cents(legacy_totals.get("initialAssigned"))
+        funded_cents = max(funded_cents, available_cents)
+        liquidated_cents = max(funded_cents - available_cents, 0)
+        now = _now_utc()
+        state_filter = ProjectFundingService._pool_state_filter(project["_id"], year)
+        state = {
+            **ProjectFundingService._empty_pool_state(project["_id"], year),
+            "initialFundedCents": funded_cents,
+            "totalFundedCents": funded_cents,
+            "liquidatedCents": liquidated_cents,
+            "availableCents": available_cents,
+            "movementsCount": 1,
+            "lastMovementAt": now,
+            "updatedAt": now,
+        }
+        existing_state = mongo.db.project_fund_state.find_one(state_filter)
+        if not existing_state:
+            mongo.db.project_fund_state.insert_one(state)
+            mongo.db.project_fund_movements.insert_one({
+                "operationId": str(uuid.uuid4()),
+                "year": int(year),
+                "projectId": str(project["_id"]),
+                "type": "migration",
+                "amountCents": 0,
+                "deltaCents": 0,
+                "balanceAfterCents": available_cents,
+                "currency": "VES",
+                "description": note or "Consolidación del saldo anterior en la bolsa única",
+                "reference": {
+                    "kind": "pool_migration",
+                    "previousVersion": int(model.get("version") or 0),
+                    "previousStatus": model.get("status"),
+                },
+                "createdBy": str(user.get("sub") or ""),
+                "actorName": user.get("nombre", "Usuario"),
+                "createdAt": now,
+            })
+
+        new_model = {
+            **model,
+            "version": PROJECT_FUNDING_VERSION,
+            "status": "pooled",
+            "migratedAt": now,
+            "migratedBy": str(user.get("sub") or ""),
+            "migrationNote": note or "Consolidación a bolsa única",
+            "initialAssignedAmount": funded_cents,
+        }
+        mongo.db.proyectos.update_one(
+            {"_id": project["_id"]},
+            {
+                "$set": {
+                    "fundingModel": new_model,
+                    "balance": available_cents,
+                    "balance_inicial": funded_cents,
+                }
+            },
+        )
+        project["fundingModel"] = new_model
+        agregar_log(
+            project["_id"],
+            f'{user.get("nombre", "Usuario")} consolidó el saldo del proyecto en una bolsa única',
+        )
+        return {
+            "projectId": str(project["_id"]),
+            "operation": "migration",
+            "alreadyMigrated": False,
+            "fundingSummary": ProjectFundingService.build_summary(project, year=year, user=user),
+        }
+
+    @staticmethod
     def _validate_source_scope(project: Dict[str, Any], user: Dict[str, Any], source_scope_type: str, source_scope_id: str) -> None:
         role = user.get("role")
         project_department_id = str(project.get("departamento_id")) if project.get("departamento_id") else ""
@@ -375,10 +649,17 @@ class ProjectFundingService:
         project = mongo.db.proyectos.find_one({"_id": project["_id"]}) or project
         model = ProjectFundingService.ensure_model(project, persist=True)
         if migration:
-            if model.get("status") not in {"legacy", "pending_migration"}:
-                raise ValueError("La migración solo aplica a proyectos legacy")
-        elif model.get("status") in {"legacy", "pending_migration"}:
-            raise ValueError("Este proyecto requiere migración de saldo legacy antes de recibir nuevas asignaciones")
+            permissions = ProjectFundingService.permissions_for_user(project, user)
+            if not permissions.get("canFund"):
+                raise ValueError(permissions.get("reason") or "No autorizado para consolidar fondos")
+            return ProjectFundingService.migrate_to_pool(
+                project,
+                year=year,
+                user=user,
+                note=note,
+            )
+        if int(model.get("version") or 0) < PROJECT_FUNDING_VERSION or model.get("status") != "pooled":
+            raise ValueError("Este proyecto debe consolidar su saldo en la bolsa única antes de recibir fondos")
 
         ProjectFundingService._validate_source_scope(project, user, source_scope_type, source_scope_id)
 
@@ -387,15 +668,13 @@ class ProjectFundingService:
         total_units = 0.0
         for item in allocations or []:
             from_account_code = _clean_str(item.get("fromAccountCode"))
-            to_account_code = _clean_str(item.get("toAccountCode"))
             amount = float(item.get("amount") or 0)
             description = _clean_str(item.get("description"))
-            if not from_account_code or not to_account_code or amount <= 0:
-                raise ValueError("Cada asignación requiere fromAccountCode, toAccountCode y amount mayor a 0")
+            if not from_account_code or amount <= 0:
+                raise ValueError("Cada asignación requiere fromAccountCode y amount mayor a 0")
             normalized_allocations.append(
                 {
                     "fromAccountCode": from_account_code,
-                    "toAccountCode": to_account_code,
                     "amount": amount,
                     "description": description,
                 }
@@ -405,11 +684,6 @@ class ProjectFundingService:
 
         if not normalized_allocations:
             raise ValueError("allocations es requerido")
-
-        if migration:
-            legacy_balance_units = _cents_to_units(model.get("legacyCurrentBalanceSnapshot"))
-            if round(total_units, 2) != round(legacy_balance_units, 2):
-                raise ValueError("La suma asignada debe coincidir exactamente con el saldo legacy actual pendiente")
 
         for account_code, total_amount in grouped_source.items():
             state = mongo.db.account_scope_state.find_one(
@@ -425,55 +699,95 @@ class ProjectFundingService:
             if not allow_negative and (balance - total_amount) < 0:
                 raise ValueError(f"Saldo insuficiente en la cuenta origen {account_code}")
 
-        operation_kind = "migration" if migration else "funding"
         results = []
         for item in normalized_allocations:
             reference = {
-                "kind": "transfer",
-                "fundingType": operation_kind,
+                "kind": "project_pool_funding",
+                "fundingType": "funding",
                 "projectId": str(project["_id"]),
                 "projectName": project.get("nombre", ""),
                 "actorName": user.get("nombre", "Usuario"),
-                "title": "Migración de saldo legacy" if migration else "Asignación de fondos",
+                "title": "Asignación de fondos a la bolsa del proyecto",
                 "sourceScopeType": source_scope_type,
                 "sourceScopeId": str(source_scope_id),
-                "toScopeType": "project",
+                "toScopeType": "project_pool",
                 "toScopeId": str(project["_id"]),
             }
-            result = AccountScopeService.transfer_between_accounts(
+            description = item["description"] or reference["title"]
+            source_result = AccountScopeService.create_movement(
                 year=int(year),
-                from_scope_type=source_scope_type,
-                from_scope_id=str(source_scope_id),
-                to_scope_type="project",
-                to_scope_id=str(project["_id"]),
-                from_account_code=item["fromAccountCode"],
-                to_account_code=item["toAccountCode"],
+                scope_type=source_scope_type,
+                scope_id=str(source_scope_id),
+                account_code=item["fromAccountCode"],
+                movement_type="credit",
                 amount=float(item["amount"]),
-                description=item["description"] or reference["title"],
+                description=description,
                 reference=reference,
                 created_by=str(user.get("sub")),
                 allow_negative=allow_negative,
             )
-            results.append(result)
+            try:
+                pool_result = ProjectFundingService._record_pool_movement(
+                    project,
+                    year=year,
+                    movement_type="funding",
+                    amount_cents=_amount_to_cents(item["amount"]),
+                    user=user,
+                    description=description,
+                    reference=reference,
+                    source_scope_type=source_scope_type,
+                    source_scope_id=source_scope_id,
+                    source_account_code=item["fromAccountCode"],
+                )
+            except Exception:
+                AccountScopeService.create_movement(
+                    year=int(year),
+                    scope_type=source_scope_type,
+                    scope_id=str(source_scope_id),
+                    account_code=item["fromAccountCode"],
+                    movement_type="debit",
+                    amount=float(item["amount"]),
+                    description=f"Reverso automático: {description}",
+                    reference={**reference, "kind": "project_pool_funding_reversal"},
+                    created_by=str(user.get("sub")),
+                    allow_negative=True,
+                )
+                raise
+            results.append({
+                "fromAccountCode": item["fromAccountCode"],
+                "amount": float(item["amount"]),
+                "sourceState": source_result.get("state"),
+                "poolState": pool_result.get("state"),
+            })
 
-            action = "migro saldo legacy" if migration else "asigno fondos"
             agregar_log(
                 project["_id"],
-                f'{user.get("nombre", "Usuario")} {action} al proyecto en la partida {item["toAccountCode"]} '
-                f'desde {source_scope_type}:{source_scope_id} por un monto de Bs. {float(item["amount"]):.2f}',
+                f'{user.get("nombre", "Usuario")} asignó fondos a la bolsa del proyecto '
+                f'desde la cuenta {item["fromAccountCode"]} por Bs. {float(item["amount"]):.2f}',
             )
 
         project = ProjectFundingService._apply_model_update_after_funding(
             project,
             funding_cents=_amount_to_cents(total_units),
-            mode="migration" if migration else "funding",
+            mode="funding",
             user=user,
             note=note,
         )
 
+        pool_state = ProjectFundingService.get_pool_state(project["_id"], year, create=True)
+        mongo.db.proyectos.update_one(
+            {"_id": project["_id"]},
+            {
+                "$set": {
+                    "balance": int(pool_state.get("availableCents", 0) or 0),
+                    "balance_inicial": int(pool_state.get("totalFundedCents", 0) or 0),
+                }
+            },
+        )
+
         return {
             "projectId": str(project["_id"]),
-            "operation": operation_kind,
+            "operation": "funding",
             "allocations": results,
             "fundingSummary": ProjectFundingService.build_summary(project, year=year, user=user),
         }
@@ -497,20 +811,37 @@ class ProjectFundingService:
             raise ValueError("amount debe ser mayor que 0")
 
         model = ProjectFundingService.ensure_model(project, persist=True)
-        if model.get("status") in {"legacy", "pending_migration"}:
-            raise ValueError("Este proyecto debe migrarse a partidas antes de registrar consumos por cuenta")
+        if int(model.get("version") or 0) < PROJECT_FUNDING_VERSION or model.get("status") != "pooled":
+            raise ValueError("Este proyecto debe consolidar su saldo en la bolsa única antes de registrar cierres")
 
-        result = AccountScopeService.create_movement(
-            year=int(year),
-            scope_type="project",
-            scope_id=str(project["_id"]),
-            account_code=str(account_code),
-            movement_type="credit",
-            amount=float(amount),
+        account = mongo.db.master_accounts.find_one(
+            {"year": int(year), "code": str(account_code)},
+            {"_id": 0, "is_header": 1, "group": 1},
+        )
+        if not account:
+            raise ValueError("La cuenta contable no existe para el año indicado")
+        if account.get("is_header"):
+            raise ValueError("Selecciona una cuenta detalle para liquidar el gasto")
+        if str(account.get("group") or "").upper() != "EGRESO":
+            raise ValueError("La liquidación debe imputarse a una cuenta de egreso")
+
+        reference_data = reference or {}
+        movement_type = "rule" if reference_data.get("kind") == "fixed_rule" else "liquidation"
+        result = ProjectFundingService._record_pool_movement(
+            project,
+            year=year,
+            movement_type=movement_type,
+            amount_cents=_amount_to_cents(amount),
+            user=user,
             description=description,
-            reference=reference or {},
-            created_by=str(user.get("sub")),
-            allow_negative=allow_negative,
+            reference=reference_data,
+            expense_account_code=str(account_code),
+        )
+
+        state = result.get("state") or {}
+        mongo.db.proyectos.update_one(
+            {"_id": project["_id"]},
+            {"$set": {"balance": int(state.get("availableCents", 0) or 0)}},
         )
 
         agregar_log(project["_id"], log_message)
@@ -575,6 +906,51 @@ class ProjectFundingService:
                     "toScopeType": reference.get("toScopeType") or ("project" if event_type in {"funding", "migration"} else None),
                     "toScopeId": reference.get("toScopeId") or (project_id if event_type in {"funding", "migration"} else None),
                     "actorName": reference.get("actorName") or row.get("createdBy", ""),
+                    "reference": reference,
+                }
+            )
+
+        pool_rows = list(
+            mongo.db.project_fund_movements.find(
+                {"year": int(year), "projectId": project_id}
+            )
+        )
+        pool_rows.sort(key=lambda item: _sort_datetime(item.get("createdAt")))
+        for row in pool_rows:
+            pool_type = row.get("type")
+            event_type = {
+                "funding": "funding",
+                "liquidation": "expense",
+                "rule": "rule",
+                "migration": "migration",
+                "reversal": "adjustment",
+                "adjustment": "adjustment",
+            }.get(pool_type, "adjustment")
+            reference = row.get("reference") or {}
+            title = reference.get("title") or {
+                "funding": "Asignación a la bolsa del proyecto",
+                "expense": "Liquidación de actividad",
+                "rule": "Liquidación de regla fija",
+                "migration": "Consolidación a bolsa única",
+                "adjustment": "Ajuste de la bolsa del proyecto",
+            }.get(event_type, "Movimiento de fondos")
+            timeline.append(
+                {
+                    "id": str(row.get("_id") or row.get("operationId")),
+                    "occurredAt": row.get("createdAt"),
+                    "type": event_type,
+                    "source": "project_pool",
+                    "title": title,
+                    "description": row.get("description", ""),
+                    "amount": _cents_to_units(row.get("deltaCents")),
+                    "projectBalanceAfter": _cents_to_units(row.get("balanceAfterCents")),
+                    "accountCode": row.get("expenseAccountCode") or row.get("sourceAccountCode"),
+                    "accountDescription": reference.get("accountDescription", ""),
+                    "fromScopeType": row.get("sourceScopeType"),
+                    "fromScopeId": row.get("sourceScopeId"),
+                    "toScopeType": "project_pool" if event_type == "funding" else None,
+                    "toScopeId": project_id if event_type == "funding" else None,
+                    "actorName": row.get("actorName") or row.get("createdBy", ""),
                     "reference": reference,
                 }
             )

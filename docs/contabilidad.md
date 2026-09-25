@@ -11,6 +11,20 @@ Colecciones:
 - `master_budget_categories`
 - `account_scope_state`
 - `ledger_movements`
+- `project_fund_state` (saldo unificado por proyecto y año, expresado en céntimos)
+- `project_fund_movements` (historial de fondeos, liquidaciones y migraciones de la bolsa)
+
+## Bolsa única de proyectos
+
+Los proyectos con `fundingModel.version = 3` y `status = pooled` no mantienen saldos por cuenta contable. El dinero recibido se consolida en una sola bolsa:
+
+- Al fondear, se descuenta la cuenta de origen global o departamental y se incrementa `project_fund_state.availableCents`.
+- La cuenta de origen queda registrada en el movimiento para auditoría, pero no crea una cuenta/saldo dentro del proyecto.
+- Al cerrar una actividad o aplicar una regla fija, se selecciona la cuenta de gasto y el monto se descuenta de la bolsa única.
+- Los requerimientos de detalle aportan automáticamente su cuenta. Si el requerimiento apunta a una cuenta cabecera, administración elige una cuenta detalle descendiente durante el cierre.
+- No se permiten movimientos contables directos ni transferencias hacia cuentas internas de un proyecto con bolsa única.
+
+Los proyectos anteriores deben ejecutar una sola vez la consolidación. La migración toma el saldo disponible existente, conserva el histórico contable y no vuelve a descontar las cuentas que originalmente alimentaron al proyecto.
 
 ## Seed (idempotente)
 
@@ -62,6 +76,41 @@ Fallback durante seed:
 - `GET /projects/:id/accounts?year=2025`
 - `POST /projects/:id/accounts/init?year=2025&mode=detail_only|all|group:EGRESO`
 - `POST /projects/:id/movements`
+
+Los endpoints de cuentas por proyecto quedan disponibles únicamente para compatibilidad con proyectos segmentados anteriores. Para proyectos con bolsa única, los endpoints de inicialización y movimientos directos responden `409`.
+
+### Fondos del proyecto
+
+- `GET /projects/:id/funding-summary?year=2025`
+- `GET /projects/:id/funding-timeline?year=2025`
+- `POST /projects/:id/funding-allocations`
+- `POST /projects/:id/funding-migration`
+
+Fondeo desde una cuenta departamental:
+
+```json
+{
+  "year": 2025,
+  "sourceScopeType": "department",
+  "sourceScopeId": "67ab1234...",
+  "allocations": [
+    {
+      "fromAccountCode": "301010100000",
+      "amount": 250,
+      "description": "Asignación para el proyecto"
+    }
+  ]
+}
+```
+
+Consolidación de un proyecto anterior (no requiere asignaciones ni cuenta de origen):
+
+```json
+{
+  "year": 2025,
+  "note": "Consolidación a bolsa única"
+}
+```
 
 Filtros opcionales en `GET /projects/:id/accounts` y `GET /departments/:id/accounts`:
 - `assignedOnly=true|false` (default `false`): solo cuentas existentes en `account_scope_state` del scope.

@@ -3,6 +3,7 @@ from io import BytesIO
 from types import SimpleNamespace
 import json
 
+import pytest
 from bson import ObjectId
 from pymongo import UpdateOne
 
@@ -53,6 +54,8 @@ class InMemoryCollection:
         if isinstance(expected, dict):
             if "$in" in expected:
                 return current in expected["$in"]
+            if "$gte" in expected:
+                return current is not None and current >= expected["$gte"]
             if "$regex" in expected:
                 import re
                 pattern = expected["$regex"]
@@ -154,6 +157,25 @@ class InMemoryCollection:
             upserted_id=upserted_id,
         )
 
+    def find_one_and_update(self, query, update, upsert=False, return_document=None, session=None):
+        row = next((r for r in self.rows if self._match(r, query)), None)
+        if row is None:
+            if not upsert:
+                return None
+            row = {
+                key: value
+                for key, value in query.items()
+                if not isinstance(value, dict)
+            }
+            row.update(update.get("$setOnInsert", {}))
+            self.rows.append(row)
+        for key, value in update.get("$inc", {}).items():
+            current = self._resolve_field(row, key) or 0
+            self._assign_field(row, key, current + value)
+        for key, value in update.get("$set", {}).items():
+            self._assign_field(row, key, value)
+        return dict(row)
+
     def count_documents(self, query):
         return len([r for r in self.rows if self._match(r, query)])
 
@@ -178,6 +200,8 @@ class InMemoryDB:
         self.master_budget_categories = InMemoryCollection()
         self.account_scope_state = InMemoryCollection()
         self.ledger_movements = InMemoryCollection()
+        self.project_fund_state = InMemoryCollection()
+        self.project_fund_movements = InMemoryCollection()
         self.proyectos = InMemoryCollection()
         self.documentos = InMemoryCollection()
         self.departamentos = InMemoryCollection()
@@ -699,8 +723,11 @@ def test_validacion_item_monto_cero_y_cuenta():
     assert "monto 0" in documents_routes._validate_activity_item(
         {"monto": 0, "accountCode": "401010100000"}
     )
-    assert "cuenta asociada" in documents_routes._validate_activity_item(
+    assert documents_routes._validate_activity_item(
         {"monto": 100, "accountCode": ""}
+    ) is None
+    assert "cuenta asociada" in documents_routes._validate_activity_item(
+        {"monto": 100, "accountCode": ""}, require_account=True
     )
 
 
@@ -807,7 +834,23 @@ def test_cerrar_presupuesto_registra_cierre_administrativo_y_restringe_permisos(
     project_id = ObjectId()
     doc_id = ObjectId()
     mongo_stub.db.proyectos.rows.append(
-        {"_id": project_id, "departamento_id": ObjectId(), "nombre": "Proyecto", "fundingYear": 2026}
+        {
+            "_id": project_id,
+            "departamento_id": ObjectId(),
+            "nombre": "Proyecto",
+            "fundingYear": 2026,
+            "fundingModel": {"version": 3, "status": "pooled"},
+        }
+    )
+    mongo_stub.db.project_fund_state.rows.append(
+        {
+            "year": 2026,
+            "projectId": str(project_id),
+            "availableCents": 100000,
+            "totalFundedCents": 100000,
+            "liquidatedCents": 0,
+            "movementsCount": 1,
+        }
     )
     mongo_stub.db.documentos.rows.append({"_id": doc_id, "project_id": project_id, "descripcion": "Actividad"})
 
@@ -968,8 +1011,14 @@ def test_actividad_items_cierre_parcial_y_cierre_pendientes(monkeypatch, tmp_pat
     mongo_stub = MongoStub()
     consumed = []
     monkeypatch.setattr(documents_routes, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
     monkeypatch.setattr(documents_routes, "can_access_project", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(documents_routes, "agregar_log", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        documents_routes.RequirementCatalogService,
+        "find_account",
+        lambda year, code: mongo_stub.db.master_accounts.find_one({"year": int(year), "code": str(code)}),
+    )
     monkeypatch.setattr(
         documents_routes.ProjectFundingService,
         "consume_project_account",
@@ -980,7 +1029,37 @@ def test_actividad_items_cierre_parcial_y_cierre_pendientes(monkeypatch, tmp_pat
     project_id = ObjectId()
     doc_id = ObjectId()
     mongo_stub.db.proyectos.rows.append(
-        {"_id": project_id, "departamento_id": ObjectId(), "nombre": "Proyecto", "fundingYear": 2026}
+        {
+            "_id": project_id,
+            "departamento_id": ObjectId(),
+            "nombre": "Proyecto",
+            "fundingYear": 2026,
+            "fundingModel": {"version": 3, "status": "pooled"},
+        }
+    )
+    mongo_stub.db.project_fund_state.rows.append(
+        {
+            "year": 2026,
+            "projectId": str(project_id),
+            "availableCents": 100000,
+            "totalFundedCents": 100000,
+            "liquidatedCents": 0,
+            "movementsCount": 1,
+        }
+    )
+    mongo_stub.db.master_accounts.rows.extend(
+        [
+            {
+                "year": 2026,
+                "code": code,
+                "description": "Cuenta de gasto",
+                "group": "EGRESO",
+                "is_header": False,
+                "level": 4,
+                "parent_code": "401010000000",
+            }
+            for code in ("401010100000", "401010200000")
+        ]
     )
     mongo_stub.db.documentos.rows.append(
         {
@@ -1383,8 +1462,9 @@ def test_asignar_regla_fija_usa_el_ano_del_proyecto(monkeypatch):
     monkeypatch.setattr(rules_routes, "actualizar_pasos", lambda status, _step: (status, []))
     monkeypatch.setattr(
         rules_routes.ProjectFundingService,
-        "_project_balance_for_account",
-        lambda *_args, **kwargs: checked_years.append(kwargs["year"]) or 9999,
+        "build_summary",
+        lambda *_args, **kwargs: checked_years.append(kwargs["year"])
+        or {"totals": {"currentAvailable": 9999}},
     )
     monkeypatch.setattr(
         rules_routes.ProjectFundingService,
@@ -1612,6 +1692,22 @@ def test_project_funding_summary_legacy_uses_snapshots(monkeypatch):
     assert summary["totals"]["initialAssigned"] == 1500.0
 
 
+def test_new_projects_start_with_unified_pool_and_existing_projects_require_migration():
+    new_model = ProjectFundingService.ensure_model(
+        {"balance": 0, "balance_inicial": 0},
+        persist=False,
+    )
+    existing_model = ProjectFundingService.ensure_model(
+        {"_id": ObjectId(), "balance": 0, "balance_inicial": 0},
+        persist=False,
+    )
+
+    assert new_model["version"] == 3
+    assert new_model["status"] == "pooled"
+    assert existing_model["version"] == 2
+    assert existing_model["status"] == "active"
+
+
 def test_project_funding_summary_uses_current_available_when_initial_missing(monkeypatch):
     mongo_stub = MongoStub()
     monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
@@ -1623,8 +1719,8 @@ def test_project_funding_summary_uses_current_available_when_initial_missing(mon
         "balance_inicial": 0,
         "status": {"actual": 1, "completado": []},
         "fundingModel": {
-            "version": 2,
-            "status": "active",
+            "version": 3,
+            "status": "pooled",
             "configuredAt": None,
             "migratedAt": None,
             "migratedBy": None,
@@ -1646,13 +1742,13 @@ def test_project_funding_summary_uses_current_available_when_initial_missing(mon
             "parent_code": "403100000000",
         }
     )
-    mongo_stub.db.account_scope_state.rows.append(
+    mongo_stub.db.project_fund_state.rows.append(
         {
             "year": 2026,
-            "scopeType": "project",
-            "scopeId": str(project["_id"]),
-            "accountCode": "403109900000",
-            "balance": 300.0,
+            "projectId": str(project["_id"]),
+            "availableCents": 30000,
+            "totalFundedCents": 30000,
+            "liquidatedCents": 0,
             "movementsCount": 1,
             "lastMovementAt": None,
         }
@@ -1770,8 +1866,8 @@ def test_allocate_funds_updates_project_and_states(monkeypatch):
         "balance_inicial": 0,
         "status": {"actual": 1, "completado": []},
         "fundingModel": {
-            "version": 2,
-            "status": "active",
+            "version": 3,
+            "status": "pooled",
             "configuredAt": None,
             "migratedAt": None,
             "migratedBy": None,
@@ -1801,7 +1897,6 @@ def test_allocate_funds_updates_project_and_states(monkeypatch):
         allocations=[
             {
                 "fromAccountCode": "401010100000",
-                "toAccountCode": "401010200000",
                 "amount": 250.0,
                 "description": "Asignacion inicial",
             }
@@ -1815,6 +1910,91 @@ def test_allocate_funds_updates_project_and_states(monkeypatch):
     updated_project = mongo_stub.db.proyectos.find_one({"_id": project_id})
     assert updated_project["fundingModel"]["initialAssignedAmount"] == 25000
     assert 1 in updated_project["status"]["completado"]
+    source_state = mongo_stub.db.account_scope_state.find_one(
+        {
+            "year": 2025,
+            "scopeType": "department",
+            "scopeId": str(department_id),
+            "accountCode": "401010100000",
+        }
+    )
+    assert source_state["balance"] == 250.0
+    assert not mongo_stub.db.account_scope_state.find_one(
+        {"year": 2025, "scopeType": "project", "scopeId": str(project_id)}
+    )
+
+
+def test_project_liquidation_consumes_unified_pool_and_rejects_overdraft(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(accounting_service, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+    monkeypatch.setattr(project_funding_service, "agregar_log", lambda *args, **kwargs: None)
+
+    project_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "nombre": "Proyecto con bolsa",
+        "balance": 30000,
+        "balance_inicial": 30000,
+        "status": {"actual": 2, "completado": [1]},
+        "fundingModel": {"version": 3, "status": "pooled"},
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+    mongo_stub.db.master_accounts.rows.append(
+        {
+            "year": 2026,
+            "code": "401010100000",
+            "description": "Materiales",
+            "group": "EGRESO",
+            "is_header": False,
+            "level": 4,
+            "parent_code": "401010000000",
+        }
+    )
+    mongo_stub.db.project_fund_state.rows.append(
+        {
+            "year": 2026,
+            "projectId": str(project_id),
+            "availableCents": 30000,
+            "initialFundedCents": 30000,
+            "totalFundedCents": 30000,
+            "liquidatedCents": 0,
+            "movementsCount": 1,
+        }
+    )
+
+    result = ProjectFundingService.consume_project_account(
+        project,
+        year=2026,
+        account_code="401010100000",
+        amount=120.0,
+        user={"sub": "admin-1", "nombre": "Admin"},
+        description="Cierre de materiales",
+        reference={"kind": "project_expense", "activityItemId": "item-1"},
+        allow_negative=False,
+        log_message="Cierre administrativo",
+    )
+
+    assert result["state"]["availableCents"] == 18000
+    assert result["state"]["liquidatedCents"] == 12000
+    assert mongo_stub.db.proyectos.find_one({"_id": project_id})["balance"] == 18000
+    assert mongo_stub.db.project_fund_movements.rows[-1]["expenseAccountCode"] == "401010100000"
+
+    with pytest.raises(ValueError, match="excede el saldo disponible"):
+        ProjectFundingService.consume_project_account(
+            project,
+            year=2026,
+            account_code="401010100000",
+            amount=181.0,
+            user={"sub": "admin-1", "nombre": "Admin"},
+            description="Cierre sin saldo",
+            reference={"kind": "project_expense"},
+            allow_negative=False,
+            log_message="Cierre administrativo",
+        )
+
+    state = mongo_stub.db.project_fund_state.find_one({"year": 2026, "projectId": str(project_id)})
+    assert state["availableCents"] == 18000
 
 
 def test_migration_requires_exact_total_and_activates_project(monkeypatch):
@@ -1889,9 +2069,45 @@ def test_migration_requires_exact_total_and_activates_project(monkeypatch):
     )
 
     updated_project = mongo_stub.db.proyectos.find_one({"_id": project_id})
-    assert updated_project["fundingModel"]["status"] == "active"
+    assert updated_project["fundingModel"]["status"] == "pooled"
+    assert updated_project["fundingModel"]["version"] == 3
     assert updated_project["fundingModel"]["initialAssignedAmount"] == 120000
     assert result["fundingSummary"]["totals"]["currentAvailable"] == 1000.0
+    source_state = mongo_stub.db.account_scope_state.find_one(
+        {
+            "year": 2025,
+            "scopeType": "department",
+            "scopeId": str(department_id),
+            "accountCode": "401010100000",
+        }
+    )
+    assert source_state["balance"] == 1200.0
+
+
+def test_project_pool_migration_requires_funding_permission(monkeypatch):
+    mongo_stub = MongoStub()
+    monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)
+
+    project = {
+        "_id": ObjectId(),
+        "departamento_id": ObjectId(),
+        "balance": 10000,
+        "balance_inicial": 10000,
+        "fundingModel": {"version": 2, "status": "legacy"},
+    }
+    mongo_stub.db.proyectos.rows.append(project)
+
+    with pytest.raises(ValueError, match="Solo super admin"):
+        ProjectFundingService.allocate_funds(
+            project,
+            year=2026,
+            source_scope_type="",
+            source_scope_id="",
+            allocations=[],
+            user={"sub": "member-1", "role": "usuario", "nombre": "Miembro"},
+            allow_negative=False,
+            migration=True,
+        )
 
 
 def test_build_timeline_merges_ledger_and_legacy(monkeypatch):
