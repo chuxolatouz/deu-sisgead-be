@@ -20,7 +20,6 @@ from api.util.access import (
     parse_object_id,
     user_department_id,
     user_role,
-    ROLE_SUPER_ADMIN,
 )
 from api.util.project_members import normalize_project_member_role
 
@@ -572,6 +571,12 @@ def asignar_usuario_proyecto(user):
     data = request.get_json(silent=True) or {}
     proyecto_id = _pick_value(data, "projectId", "project_id", "proyecto_id")
     usuario = _pick_value(data, "user", "usuario")
+    requested_department_id = _pick_value(
+        data,
+        "departmentId",
+        "department_id",
+        "departamento_id",
+    )
     role = normalize_project_member_role(data.get("role"))
     if not proyecto_id:
         return jsonify({"message": "projectId es requerido (también se acepta project_id o proyecto_id)"}), 400
@@ -605,11 +610,28 @@ def asignar_usuario_proyecto(user):
         return jsonify({"message": "Usuario no encontrado"}), 404
 
     project_department_id = parse_object_id(proyecto.get("departamento_id"))
+    selected_department_id = parse_object_id(requested_department_id)
+    if requested_department_id and not selected_department_id:
+        return jsonify({"message": "departmentId inválido"}), 400
+
+    if project_department_id:
+        if selected_department_id and str(selected_department_id) != str(project_department_id):
+            return jsonify({"message": "El departamento seleccionado no coincide con el departamento del proyecto"}), 400
+        assignment_department_id = project_department_id
+    else:
+        if not is_super_admin(user):
+            return _forbidden(
+                "Solo super_admin puede asignar usuarios a un proyecto sin departamento"
+            )
+        if not selected_department_id:
+            return jsonify({
+                "message": "Selecciona el departamento de los usuarios que deseas asignar"
+            }), 400
+        assignment_department_id = selected_department_id
+
     target_user_department = parse_object_id(target_user.get("departamento_id") or target_user.get("departmentId"))
-    target_user_role = (target_user.get("rol") or "usuario").strip()
-    if project_department_id and target_user_role != ROLE_SUPER_ADMIN:
-        if not target_user_department or str(target_user_department) != str(project_department_id):
-            return jsonify({"message": "El usuario solo puede ser asignado a proyectos de su departamento"}), 400
+    if not target_user_department or str(target_user_department) != str(assignment_department_id):
+        return jsonify({"message": "El usuario debe pertenecer al departamento seleccionado"}), 400
 
     fecha_hora_actual = datetime.now(timezone.utc)
     member_user = {

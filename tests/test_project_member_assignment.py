@@ -121,6 +121,109 @@ def test_assign_member_reports_missing_project_id_explicitly():
     assert "projectId es requerido" in response.get_json()["message"]
 
 
+def test_only_super_admin_can_assign_members_when_project_has_no_department(monkeypatch):
+    project_id = ObjectId()
+    actor_id = ObjectId()
+    department_id = ObjectId()
+    target_user_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "owner": actor_id,
+        "miembros": [],
+        "status": {"actual": 1, "completado": []},
+    }
+    target_user = {
+        "_id": target_user_id,
+        "nombre": "Usuario",
+        "rol": "usuario",
+        "departamento_id": department_id,
+    }
+    projects = ProjectCollection(project)
+    monkeypatch.setattr(
+        projects_routes,
+        "mongo",
+        SimpleNamespace(
+            db=SimpleNamespace(
+                proyectos=projects,
+                usuarios=UserCollection(target_user),
+            )
+        ),
+    )
+
+    payload = {
+        "projectId": str(project_id),
+        "departmentId": str(department_id),
+        "user": {"_id": str(target_user_id)},
+        "role": {"value": "miembro", "label": "Miembro"},
+    }
+    actor = {
+        "sub": str(actor_id),
+        "nombre": "Usuario propietario",
+        "role": "usuario",
+    }
+
+    with app.test_request_context(json=payload):
+        response, status = projects_routes.asignar_usuario_proyecto.__wrapped__.__wrapped__(actor)
+
+    assert status == 403
+    assert "No autorizado" in response.get_json()["message"]
+
+
+def test_super_admin_filters_member_assignment_by_selected_department(monkeypatch):
+    project_id = ObjectId()
+    department_id = ObjectId()
+    target_user_id = ObjectId()
+    project = {
+        "_id": project_id,
+        "miembros": [],
+        "status": {"actual": 1, "completado": []},
+    }
+    target_user = {
+        "_id": target_user_id,
+        "nombre": "Usuario del departamento",
+        "rol": "usuario",
+        "departamento_id": department_id,
+    }
+    projects = ProjectCollection(project)
+    monkeypatch.setattr(
+        projects_routes,
+        "mongo",
+        SimpleNamespace(
+            db=SimpleNamespace(
+                proyectos=projects,
+                usuarios=UserCollection(target_user),
+            )
+        ),
+    )
+    monkeypatch.setattr(projects_routes, "agregar_log", lambda *_args, **_kwargs: None)
+
+    payload = {
+        "projectId": str(project_id),
+        "departmentId": str(department_id),
+        "user": {"_id": str(target_user_id)},
+        "role": {"value": "miembro", "label": "Miembro"},
+    }
+    actor = {
+        "sub": str(ObjectId()),
+        "nombre": "Super Admin",
+        "role": "super_admin",
+    }
+
+    with app.test_request_context(json=payload):
+        response, status = projects_routes.asignar_usuario_proyecto.__wrapped__.__wrapped__(actor)
+
+    assert status == 200
+    assert projects.last_update is not None
+
+    other_department_id = ObjectId()
+    payload["departmentId"] = str(other_department_id)
+    with app.test_request_context(json=payload):
+        response, status = projects_routes.asignar_usuario_proyecto.__wrapped__.__wrapped__(actor)
+
+    assert status == 400
+    assert "departamento seleccionado" in response.get_json()["message"]
+
+
 def test_assign_member_rejects_incomplete_role_without_internal_error():
     payload = {
         "projectId": str(ObjectId()),

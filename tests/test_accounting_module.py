@@ -1708,6 +1708,16 @@ def test_new_projects_start_with_unified_pool_and_existing_projects_require_migr
     assert existing_model["status"] == "active"
 
 
+def test_super_admin_can_choose_department_source_for_project_without_department():
+    permissions = ProjectFundingService.permissions_for_user(
+        {"_id": ObjectId(), "fundingModel": {"version": 3, "status": "pooled"}},
+        {"sub": "admin-1", "role": "super_admin"},
+    )
+
+    assert permissions["canFund"] is True
+    assert permissions["allowedSources"] == ["department", "global"]
+
+
 def test_project_funding_summary_uses_current_available_when_initial_missing(monkeypatch):
     mongo_stub = MongoStub()
     monkeypatch.setattr(project_funding_service, "mongo", mongo_stub)

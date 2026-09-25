@@ -309,12 +309,11 @@ class ProjectFundingService:
         user_department_id = str(user.get("departmentId") or user.get("departamento_id") or "")
 
         if role == "super_admin":
-            allowed_sources = ["department"]
-            if department_id:
-                allowed_sources.append("global")
-            elif "global" not in allowed_sources:
-                allowed_sources = ["global"]
-            return {"canFund": True, "allowedSources": allowed_sources, "reason": ""}
+            return {
+                "canFund": True,
+                "allowedSources": ["department", "global"],
+                "reason": "",
+            }
 
         if role == "admin_departamento" and department_id and user_department_id == department_id:
             return {"canFund": True, "allowedSources": ["department"], "reason": ""}
